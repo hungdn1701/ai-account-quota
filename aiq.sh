@@ -1182,8 +1182,16 @@ act_save() {
 }
 
 act_use() {
-  local key="${1:-}" name d out email plan td rd same newer
-  [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias>"
+  local key="${1:-}" name d out email plan td rd same newer resume=""
+  [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias> [-c | --resume]"
+  shift
+  # An in-progress conversation lives in the transcript files and project
+  # history, none of which a switch touches — so after moving the account you
+  # can pick the session straight back up. -c/--resume does that in one step.
+  case "${1:-}" in
+    -c|--continue) resume=continue; shift ;;
+    --resume)      resume=resume; shift ;;
+  esac
   name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
   [ -z "$name" ] && die "no profile or alias called '$key' — see: aiq $PROV_CLI ls"
   d="$P_ROOT/$name"
@@ -1202,6 +1210,7 @@ act_use() {
     _sync quiet
     printf '%salready signed in as%s %s%s%s — kept the live token (it is newer than the saved one)\n' \
       "$C_CYA" "$C_RST" "$C_B" "$name" "$C_RST"
+    if [ -n "$resume" ]; then _use_resume "$resume" "$@"; fi
     return 0
   fi
 
@@ -1228,6 +1237,26 @@ act_use() {
         info "id token expired; the CLI refreshes it on next run"
       fi ;;
   esac
+
+  if [ -n "$resume" ]; then _use_resume "$resume" "$@"; fi
+}
+
+_use_resume() {
+  # Hand straight over to the CLI to continue the current session, now billed to
+  # the account we just switched to. Reached only when no CLI was running (the
+  # switch would have refused otherwise), so there is nothing to clobber.
+  local mode="$1"; shift
+  if ! command -v "$P_CLI" >/dev/null 2>&1; then
+    warn "$P_CLI is not on PATH — the account is switched; resume the session yourself"
+    return 0
+  fi
+  if [ "$PROV" = claude ]; then
+    [ "$mode" = continue ] && set -- --continue "$@" || set -- --resume "$@"
+  else
+    [ "$mode" = continue ] && set -- resume --last "$@" || set -- resume "$@"
+  fi
+  info "continuing your session:  $P_CLI $*"
+  exec "$P_CLI" "$@"
 }
 
 act_active() {
@@ -1641,6 +1670,10 @@ ACCOUNTS - one active account at a time
                                 The account you are leaving is always saved
                                 first - into its own profile, or into a new
                                 one if it had never been saved.
+  aiq <p> use <name> -c         switch, then continue the current conversation
+  aiq <p> use <name> --resume   switch, then pick a conversation to resume
+                                (your transcripts and history survive a switch;
+                                 -c / --resume just save you the second command)
   aiq <p> active                show the signed-in account
   aiq <p> run <name>            run it in its isolated workspace
   aiq <p> rename <old> <new>   rename account and workspace together
@@ -1824,7 +1857,7 @@ main() {
   local action="${1:-ls}"; [ $# -gt 0 ] && shift
   case "$action" in
     ls|list)          act_ls "${1:-}" ;;
-    use|switch)       act_use "${1:-}" ;;
+    use|switch)       act_use "$@" ;;
     archive)          act_archive "${1:-}" ;;
     restore|unarchive) act_restore "${1:-}" ;;
     prune)            act_prune "${1:-}" ;;
