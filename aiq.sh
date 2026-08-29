@@ -221,7 +221,9 @@ def claude_read(cred, session):
         b = u.get(key) or {}
         v = b.get("utilization")
         d[tag] = "" if (v is None or not fresh) else str(v)
-        d[tag + "_reset"] = iso_local(b.get("resets_at"))
+        # The reset time is as stale as the percentage it belongs to. Showing it
+        # after blanking the number invites reading a spent window as current.
+        d[tag + "_reset"] = "" if not fresh else iso_local(b.get("resets_at"))
     d["q_at"] = ms_local(cu.get("fetchedAtMs"))
     d["sub_at"] = ""
     d["sub_days"] = ""
