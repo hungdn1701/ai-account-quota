@@ -1,0 +1,4 @@
+# aiq.sh must stay LF: a CRLF shebang makes the script unrunnable on Linux/macOS.
+*.sh text eol=lf
+aiq  text eol=lf
+*.md text eol=lf
