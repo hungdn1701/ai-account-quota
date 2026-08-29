@@ -17,11 +17,15 @@ AIQ_IN_CODEX="${CODEX_HOME:-}"
 
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CLAUDE_CRED="$CLAUDE_HOME/.credentials.json"
-# Claude Code keeps account metadata beside its config dir when one is set.
-if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then
+# Claude Code resolves this as join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json").
+# Follow that exactly: keying off whether the file exists yet meant a lane whose
+# config had not been written pointed at the HOST's session file instead.
+if [ -n "${AIQ_CLAUDE_SESSION:-}" ]; then
+  CLAUDE_SESSION="$AIQ_CLAUDE_SESSION"
+elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
   CLAUDE_SESSION="$CLAUDE_CONFIG_DIR/.claude.json"
 else
-  CLAUDE_SESSION="${AIQ_CLAUDE_SESSION:-$HOME/.claude.json}"
+  CLAUDE_SESSION="$HOME/.claude.json"
 fi
 CLAUDE_PROFILES="$CLAUDE_HOME/profiles"
 
@@ -48,6 +52,8 @@ elif [ -n "$AIQ_IN_CLAUDE" ]; then
 else
   CLAUDE_HOST="$CLAUDE_HOME"
 fi
+# The host's own .claude.json sits beside its config dir, not inside it.
+CLAUDE_HOST_SESSION="$(dirname "$CLAUDE_HOST")/.claude.json"
 
 # ---------------------------------------------------------------- colours ---
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -676,6 +682,39 @@ def cmd_codex_usage(argv):
     print("ok\t1")
 
 
+def cmd_seed_projects(argv):
+    """host_json lane_json -> give a lane the host's per-project settings.
+
+    `.claude.json` lives inside CLAUDE_CONFIG_DIR, so a lane necessarily has its
+    own and re-asks the trust dialog for every directory you have already
+    approved. The `projects` map is machine state, not account state, so a lane
+    can be handed it. Existing lane entries always win: this only fills gaps."""
+    host = jload(argv[0]) or {}
+    lane_path = argv[1]
+    lane = jload(lane_path)
+    fresh = lane is None
+    if fresh:
+        lane = {}
+    hp = host.get("projects") or {}
+    lp = lane.get("projects") or {}
+    added = 0
+    for key, val in hp.items():
+        if key not in lp:
+            lp[key] = val
+            added += 1
+    if not added and not fresh:
+        print("added\t0")
+        return
+    lane["projects"] = lp
+    try:
+        with open(lane_path, "w", encoding="utf-8") as f:
+            json.dump(lane, f, indent=2)
+    except Exception as e:
+        print("error\t" + type(e).__name__)
+        return
+    print("added\t%d" % added)
+
+
 def cmd_lane_projects(argv):
     """src dst lane -> move a lane's transcripts into the shared store.
 
@@ -734,7 +773,8 @@ def cmd_dead(argv):
 
 CMDS = {"dead": cmd_dead, "active": cmd_active, "list": cmd_list, "match": cmd_match, "resolve": cmd_resolve,
         "meta": cmd_meta, "slice": cmd_slice, "merge": cmd_merge, "cmp": cmd_cmp, "usage": cmd_usage,
-        "codex_usage": cmd_codex_usage, "lane_projects": cmd_lane_projects}
+        "codex_usage": cmd_codex_usage, "lane_projects": cmd_lane_projects,
+        "seed_projects": cmd_seed_projects}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
@@ -1547,6 +1587,22 @@ _lane_share_projects() {
   return 0
 }
 
+_lane_seed_projects() {
+  # _lane_seed_projects <lane-dir> — hand the lane the directories you have
+  # already trusted. .claude.json is resolved inside CLAUDE_CONFIG_DIR, so a
+  # lane cannot share the file itself; it can be given the half that is machine
+  # state rather than account state.
+  local d="$1" out added
+  [ "$PROV" = claude ] || return 0
+  [ -f "$CLAUDE_HOST_SESSION" ] || return 0
+  [ "$CLAUDE_HOST_SESSION" = "$d/.claude.json" ] && return 0
+  out="$(_py seed_projects "$(_np "$CLAUDE_HOST_SESSION")" \
+        "$(_np "$d/.claude.json")" 2>/dev/null)"
+  added="$(_field "$out" added)"
+  [ "${added:-0}" -gt 0 ] && warn "seeded ${added} trusted project(s) into lane from your global config"
+  return 0
+}
+
 _env_paths() {
   # _env_paths <dir> -> sets EV_CRED / EV_SESS for that workspace
   if [ "$PROV" = claude ]; then EV_CRED="$1/.credentials.json"; EV_SESS="$1/.claude.json"
@@ -1611,36 +1667,29 @@ act_env() {
   # Entering a lane is the moment to make sure it shares the host's transcripts.
   # Anything printed from here must go to stderr: this output gets eval'd.
   _lane_share_projects "$d" "$name"
+  _lane_seed_projects "$d"
   case "$fmt" in
     --powershell|--pwsh)
       printf '$env:%s = "%s"\n' "$P_ENVVAR" "$native"
       if [ "$PROV" = claude ]; then
-        printf '$env:HOME = "%s"\n' "$native"
-        printf '$env:USERPROFILE = "%s"\n' "$native"
         printf '$env:AIQ_DIR = "%s"\n' "$aiq_native"
         printf '$env:AIQ_HOST_CLAUDE = "%s"\n' "$host_native"
       fi ;;
     --cmd)
       printf 'set %s=%s\n' "$P_ENVVAR" "$native"
       if [ "$PROV" = claude ]; then
-        printf 'set HOME=%s\n' "$native"
-        printf 'set USERPROFILE=%s\n' "$native"
         printf 'set AIQ_DIR=%s\n' "$aiq_native"
         printf 'set AIQ_HOST_CLAUDE=%s\n' "$host_native"
       fi ;;
     --fish)
       printf 'set -x %s '\''%s'\''\n' "$P_ENVVAR" "$native"
       if [ "$PROV" = claude ]; then
-        printf 'set -x HOME '\''%s'\''\n' "$d"
-        printf 'set -x USERPROFILE '\''%s'\''\n' "$native"
         printf 'set -x AIQ_DIR '\''%s'\''\n' "$AIQ_DIR"
         printf 'set -x AIQ_HOST_CLAUDE '\''%s'\''\n' "$CLAUDE_HOST"
       fi ;;
     *)
       printf 'export %s='\''%s'\''\n' "$P_ENVVAR" "$native"
       if [ "$PROV" = claude ]; then
-        printf 'export HOME='\''%s'\''\n' "$d"
-        printf 'export USERPROFILE='\''%s'\''\n' "$native"
         printf 'export AIQ_DIR='\''%s'\''\n' "$AIQ_DIR"
         printf 'export AIQ_HOST_CLAUDE='\''%s'\''\n' "$CLAUDE_HOST"
       fi ;;
@@ -1679,6 +1728,7 @@ act_run() {
   fi
   [ -d "$d" ] || die "account '$name' has no workspace"
   _lane_share_projects "$d" "$name"
+  _lane_seed_projects "$d"
   info "scope: LANE \"$name\" (this command only) — your global account is untouched"
   [ "${1:-}" = "--" ] && shift
   if [ $# -eq 0 ] && [ -n "$resume" ]; then
@@ -1691,7 +1741,7 @@ act_run() {
   if [ $# -eq 0 ]; then set -- "$P_CLI"; fi
   native="$(_np "$d")"
   if [ "$PROV" = claude ]; then
-    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$@"
+    env "$P_ENVVAR=$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$@"
   else
     env "$P_ENVVAR=$native" "$@"
   fi
@@ -1712,11 +1762,12 @@ act_login() {
   mkdir -p "$d" || die "could not create $d"
   _env_paths "$d"
   _lane_share_projects "$d" "$name"
+  _lane_seed_projects "$d"
   native="$(_np "$d")"
   info "account: $name"
   [ "$PROV" = claude ] && info "sign in with /login once $P_CLI starts"
   if [ "$PROV" = claude ]; then
-    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$P_CLI"
+    env "$P_ENVVAR=$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$P_CLI"
   else
     env "$P_ENVVAR=$native" "$P_CLI"
   fi
@@ -1935,6 +1986,13 @@ WORKSPACES - several accounts at the same time
   whichever account recorded them. Transcripts a lane recorded before this are
   moved into the shared store the next time you enter it; if a session file name
   is taken, the lane's copy is kept alongside as <name>.lane-<lane>.jsonl.
+
+  A lane sets CLAUDE_CONFIG_DIR and nothing else. .claude.json is resolved
+  inside that directory, so a lane keeps its own identity there - but the
+  `projects` half of that file is trust and per-directory settings, not account
+  state, and entering a lane copies in whatever entries it is missing. You are
+  not re-asked to trust directories you have already approved. Entries the lane
+  already has are left alone.
 
   aiq <p> login <name>          create an account, lane, and sign in
   aiq <p> envs                  list lanes, and which one this shell uses

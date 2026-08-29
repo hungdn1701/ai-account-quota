@@ -145,6 +145,19 @@ is moved into the shared store the first time you enter it; a session file whose
 name is already taken is kept alongside as `<name>.lane-<lane>.jsonl` rather than
 overwriting anything.
 
+A lane sets `CLAUDE_CONFIG_DIR` and nothing else. It used to set `HOME` and
+`USERPROFILE` too, which was never needed — Claude Code resolves its config as
+`join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, so the config dir alone
+is enough — and it had a real cost: every *other* tool you ran in that shell
+wrote into the lane instead of your home directory. One lane here had collected
+835MB of `AppData`, `.vscode`, `.local` and `.m2` that way.
+
+Because `.claude.json` is resolved *inside* the config dir, a lane cannot share
+that file — its identity lives there. Only half of it is account state, though:
+the `projects` map is trust and per-directory settings. Entering a lane copies
+in the entries it is missing, so you are not re-asked to trust directories you
+already approved. Entries the lane already has are never overwritten.
+
 ## Check quota
 
 ```sh
