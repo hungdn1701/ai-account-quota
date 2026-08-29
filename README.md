@@ -91,15 +91,30 @@ available for older setups.
 
 ### Two scopes: global switch vs. lane
 
+`aiq` changes accounts two ways and never guesses which you want — you pick the
+command, and every run prints a `scope:` line back.
+
 | | scope | what it touches |
 |---|---|---|
-| `aiq <p> use <name>` | **GLOBAL** | the one shared `~/.<cli>` — every terminal follows |
-| `aiq <p> run <name>` / `env` | **LANE** | an isolated config dir — this terminal only |
+| `aiq <p> use <name>` | **GLOBAL** | the one shared `~/.<cli>` — every terminal, and the next one you open |
+| `aiq <p> run <name>` / `env` | **LANE** | an isolated config dir via one env var — this terminal only |
 
-Every one of these prints a `scope:` line so you always know which you got.
-Asserting the wrong one is a clean error, not a surprise: `use --lane` and
-`run --global` both refuse and point you at the right command, and `use` inside
-a lane shell refuses outright.
+**Which command do I run?**
+
+| I want to… | run |
+|---|---|
+| change which account I use, everywhere | `aiq <p> use <name>` |
+| …and keep this conversation going on it | `aiq <p> use <name> -c` |
+| …and pick which past conversation first | `aiq <p> use <name> --resume` |
+| run two accounts at once, a terminal each | `aiq <p> run <name>` in each |
+| …but stay in this shell | `eval "$(aiq <p> env <name>)"` |
+| try another account for one command only | `aiq <p> run <name> -- <cmd>` |
+| change the account a lane is signed into | `aiq <p> login <name> --force` (from a normal terminal) |
+
+Asserting the wrong scope is a clean error, not a surprise: `use --lane` and
+`run --global` both refuse and name the right command, `use` inside a lane shell
+is refused outright, and `use --global` / `run --lane` are no-ops that document
+intent. `aiq help scope` has the same guide in the terminal.
 
 ## Switch a single account
 

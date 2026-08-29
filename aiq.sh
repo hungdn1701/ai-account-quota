@@ -1683,24 +1683,30 @@ START HERE
                                 is lost the moment you switch away from it
   aiq quota                   how much of the plan each account has used
 
-COMMON TASKS
-  Running out of quota          aiq quota            see which account has room
-  Just signed into a new one    aiq <p> save <name>
-  Change account everywhere     aiq <p> use <name>   GLOBAL: every terminal
-  Move this chat to another one aiq <p> use <name> -c  switch, then --continue
-  Use two accounts at once      aiq <p> run <name>   LANE: this terminal only
-  Forgot which account is live  aiq active
-  Clean up dead accounts        aiq <p> prune        --yes archives them
-  Something looks wrong         aiq doctor
+WHICH COMMAND?  pick by what you want; aiq assumes nothing and prints the scope
+  I want to...                                  then run
+  --------------------------------------------  ----------------------------------
+  switch account, in every terminal             aiq <p> use <name>
+    ^ and keep this conversation going          aiq <p> use <name> -c
+    ^ and pick which past conversation first    aiq <p> use <name> --resume
+  run two accounts at once, a terminal each     aiq <p> run <name>    (in each)
+    ^ but stay in this shell                    eval "$(aiq <p> env <name>)"
+  try another account for one command only      aiq <p> run <name> -- <cmd>
+  change the account a lane is signed into      aiq <p> login <name> --force
+  see who's who / how much quota is left        aiq ls  ·  aiq quota
+  save the account I'm signed in as (do first)  aiq <p> save <name>
+  retire accounts that no longer authenticate   aiq <p> prune [--yes]
 
-  SCOPE  use  = GLOBAL: one shared config, changes every terminal.
-         run / env = LANE: an isolated config, this terminal only.
-         Every one prints a `scope:` line, and asserting the wrong one
-         (use --lane, run --global) is a clean error, not a surprise.
+  SCOPE   use        -> GLOBAL: the one shared ~/.<cli>, every terminal follows
+          run / env  -> LANE:   an isolated config dir, this terminal only
+          Both print a `scope:` line. `use --lane` / `run --global` are errors
+          that name the right command; `use` inside a lane shell is refused.
+          Full guide:  aiq help scope
 
 MORE HELP
-  aiq help profiles     switching a single active account
-  aiq help workspaces   running several accounts side by side
+  aiq help scope        global switch vs lane — exactly what to run when
+  aiq help profiles     switching the one active account
+  aiq help workspaces   running several accounts side by side (lanes)
   aiq help quota        usage numbers, and what STATUS means
   aiq help why          why copying auth files logs you out of your device
   aiq help all          all of the above
@@ -1868,19 +1874,67 @@ WHY THIS EXISTS
 AIQHELP
 }
 
+help_scope() {
+  cat <<'AIQHELP'
+SCOPE - global switch vs. lane
+
+  aiq changes accounts two different ways. It never guesses which you want:
+  you pick the command, and every run prints a `scope:` line back.
+
+  GLOBAL   aiq <p> use <name>
+    Rewrites the one config directory the CLI reads by default (~/.claude,
+    ~/.codex). EVERY terminal - and the next one you open - now uses <name>.
+    The account you leave is saved first. Refuses while the CLI is running.
+    Use this when you just want to be "on" a different account for a while.
+
+  LANE     aiq <p> run <name>        (one command / one terminal)
+           eval "$(aiq <p> env <name>)"   (rest of this shell)
+    Points the CLI at an isolated config dir via one env var. Only this
+    process is affected; other terminals and the global account do not move.
+    Each lane refreshes its own token in place, so several can run at once.
+    Use this to run two accounts side by side.
+
+  WHICH DO I RUN?
+    just switch, everywhere ............... aiq <p> use <name>
+    switch + keep this chat going ......... aiq <p> use <name> -c
+    switch + pick a chat to resume ....... aiq <p> use <name> --resume
+    two accounts, two terminals .......... aiq <p> run <name>   in each
+    two accounts, keep this shell ........ eval "$(aiq <p> env <name>)"
+    one account for a single command ..... aiq <p> run <name> -- <cmd>
+    change what account a lane holds ..... aiq <p> login <name> --force
+                                            (from a normal terminal)
+
+  ASSERTING SCOPE (optional, for scripts or certainty)
+    aiq <p> use <name> --global    ok in a normal terminal; a no-op that
+                                   documents intent
+    aiq <p> use <name> --lane      error -> "use is global; for a lane: run"
+    aiq <p> run <name> --global    error -> "run is always a lane; use: use"
+    aiq <p> run <name> --lane      ok; a no-op
+    aiq <p> use <name>  (in a lane shell)   refused - that shell's config and
+                                   profile store are the lane's own, so `use`
+                                   there would not mean what it looks like
+
+  -c / --resume work on both `use` and `run`. They map to `claude --continue`
+  / `claude --resume`, and `codex resume --last` / `codex resume`. A switch
+  never touches transcripts or project history, so the conversation simply
+  carries on under the new account - the flag only saves you a second command.
+AIQHELP
+}
+
 help_topic() {
   case "${1:-}" in
+    scope|lane|lanes|global)      help_scope ;;
     profile|profiles|switch)      help_profiles ;;
     workspace|workspaces|env|envs|parallel) help_workspaces ;;
     quota|usage|status)           help_quota ;;
     why|background|trap)          help_why ;;
     all)
-      usage; printf '\n'; help_profiles; printf '\n'; help_workspaces
-      printf '\n'; help_quota; printf '\n'; help_why ;;
+      usage; printf '\n'; help_scope; printf '\n'; help_profiles; printf '\n'
+      help_workspaces; printf '\n'; help_quota; printf '\n'; help_why ;;
     ""|help)                      usage ;;
     *)
       printf 'no help topic "%s"\n\n' "$1" >&2
-      printf 'topics: profiles · workspaces · quota · why · all\n' >&2
+      printf 'topics: scope · profiles · workspaces · quota · why · all\n' >&2
       return 1 ;;
   esac
 }
@@ -1940,7 +1994,7 @@ main() {
       if [ -n "${1:-}" ]; then
         help_topic "$1"
       else
-        help_profiles; printf '\n'; help_workspaces
+        help_scope; printf '\n'; help_profiles; printf '\n'; help_workspaces
         printf '\nAlso: aiq help quota · aiq help why · aiq help all\n'
       fi ;;
     *)                printf '%saiq: %s has no action "%s"%s\n' "$C_RED" "$PROV_CLI" "$action" "$C_RST" >&2
