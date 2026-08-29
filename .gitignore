@@ -1,0 +1,14 @@
+# never let credentials or account state near this repo
+*.credentials.json
+credentials.json
+auth.json
+.claude.json
+claude.json
+profile.email
+profile.json
+usage.json
+profiles/
+envs/
+backups/
+.aiq/
+*.bak
