@@ -735,13 +735,27 @@ _backup() {
   done
 }
 
+# True only if an *interactive* CLI session is up — the kind that holds the auth
+# in memory and rewrites it on exit. Background helpers do not, and must not block
+# a switch: `codex app-server` (the VS Code / JetBrains ChatGPT extensions keep one
+# running the whole time the editor is open) and `... mcp` servers. On Windows we
+# can read command lines and skip those; elsewhere pgrep -x is name-only.
 _running() {
-  local pat; [ "$PROV" = claude ] && pat="claude" || pat="codex"
+  local exe; [ "$PROV" = claude ] && exe="claude" || exe="codex"
+  local skip='app-server|(^| )mcp( |$)|mcp-serve|--mcp'
+  if command -v powershell.exe >/dev/null 2>&1; then
+    local n
+    n="$(powershell.exe -NoProfile -Command \
+      "@(Get-CimInstance Win32_Process -Filter \"name='$exe.exe'\" | Where-Object { \$_.CommandLine -notmatch '$skip' }).Count" \
+      2>/dev/null | tr -dc '0-9')"
+    [ -n "$n" ] && { [ "$n" -gt 0 ]; return; }
+  fi
   if command -v pgrep >/dev/null 2>&1; then
-    pgrep -x "$pat" >/dev/null 2>&1 && return 0
+    pgrep -x "$exe" >/dev/null 2>&1 && return 0
+    return 1
   fi
   if command -v tasklist >/dev/null 2>&1; then
-    tasklist //FI "IMAGENAME eq $pat.exe" 2>/dev/null | grep -qi "$pat\.exe" && return 0
+    tasklist //FI "IMAGENAME eq $exe.exe" 2>/dev/null | grep -qi "$exe\.exe" && return 0
   fi
   return 1
 }
@@ -1457,8 +1471,28 @@ act_envs() {
     fi
   done
   [ "$shown" = 0 ] && info "  none yet — create one with: aiq $PROV_CLI login <name>"
-  [ "$shown" = 1 ] && info "  use one:  eval \"\$(aiq $PROV_CLI env <name>)\"   then run $P_CLI"
+  [ "$shown" = 1 ] && info "  enter one:  eval \"\$(aiq $PROV_CLI env <name>)\"  ·  delete one:  aiq $PROV_CLI env rm <name>"
   return 0
+}
+
+act_env_rm() {
+  # Delete a lane (isolated config dir). Credentials are backed up first.
+  local name="${1:-}" d
+  [ -z "$name" ] && die "usage: aiq $PROV_CLI env rm <lane>   ·   list: aiq $PROV_CLI envs"
+  d="$(_env_dir "$name")"
+  [ -d "$d" ] || die "no lane '$name' — see: aiq $PROV_CLI envs"
+  [ "$(_env_current_name)" = "$name" ] && die "lane '$name' is active in this shell — run this from another terminal"
+  if _running && [ "${AIQ_FORCE:-}" != 1 ]; then
+    warn "a $P_LABEL process is running. If it is using lane '$name', deleting it now"
+    warn "will break that session. Close it, or re-run with AIQ_FORCE=1."
+    exit 1
+  fi
+  _env_paths "$d"
+  [ -f "$EV_CRED" ] && _backup "$EV_CRED" "preenvrm"
+  rm -rf "${P_ENVROOT:?}/${name:?}" || die "could not delete lane '$name'"
+  printf 'deleted lane %s%s%s\n' "$C_B" "$name" "$C_RST"
+  [ -f "$EV_CRED" ] || return 0
+  info "  its last credential is in $AIQ_BACKUPS/$PROV — the saved profile (if any) is untouched"
 }
 
 act_env() {
@@ -1775,6 +1809,7 @@ WORKSPACES - several accounts at the same time
   aiq <p> login <name>          create an account, lane, and sign in
   aiq <p> envs                  list lanes, and which one this shell uses
   aiq <p> env <name>            print the line to put THIS shell in a lane
+  aiq <p> env rm <name>         delete a lane (credential backed up first)
   aiq <p> run <name> [cmd...]   run a command in that lane (default: the CLI)
       --lane                    explicit no-op; `run` is always a lane
       -c | --continue           launch the CLI with `--continue`, in the lane
@@ -1903,6 +1938,7 @@ SCOPE - global switch vs. lane
     one account for a single command ..... aiq <p> run <name> -- <cmd>
     change what account a lane holds ..... aiq <p> login <name> --force
                                             (from a normal terminal)
+    delete a lane ....................... aiq <p> env rm <name>
 
   ASSERTING SCOPE (optional, for scripts or certainty)
     aiq <p> use <name> --global    ok in a normal terminal; a no-op that
@@ -1978,7 +2014,11 @@ main() {
     restore|unarchive) act_restore "${1:-}" ;;
     prune)            act_prune "${1:-}" ;;
     envs|workspaces)  act_envs ;;
-    env)              act_env "${1:-}" "${2:-}" ;;
+    env)
+      case "${1:-}" in
+        rm|remove|delete) shift; act_env_rm "${1:-}" ;;
+        *)                act_env "${1:-}" "${2:-}" ;;
+      esac ;;
     run)              shift 0; act_run "$@" ;;
     login|new)        act_login "${1:-}" ;;
     workspace|ws|import|adopt)
