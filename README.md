@@ -136,6 +136,15 @@ so a switched-to account can `--continue` / `--resume` the same conversation.
 `-c` / `--resume` on `use` (and `run`) just fold that second command into the
 switch.
 
+Lanes get there a different way. Claude Code keeps transcripts inside its config
+directory, so an isolated lane would start with an empty history and
+`--continue` would find nothing. A lane isolates the *login*, not the *work*, so
+`aiq` links each lane's `projects/` to your real one — a junction on Windows (no
+admin rights needed), a symlink elsewhere. Whatever a lane recorded before this
+is moved into the shared store the first time you enter it; a session file whose
+name is already taken is kept alongside as `<name>.lane-<lane>.jsonl` rather than
+overwriting anything.
+
 ## Check quota
 
 ```sh

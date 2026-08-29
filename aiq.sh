@@ -37,6 +37,18 @@ AIQ_ENVS="$AIQ_DIR/envs"
 AIQ_CACHE="$AIQ_DIR/cache"
 AIQ_KEEP_BACKUPS="${AIQ_KEEP_BACKUPS:-40}"
 
+# Claude Code keeps conversation transcripts in $CLAUDE_CONFIG_DIR/projects, so
+# a lane would record its own and `claude --continue` after a switch would find
+# nothing. Lanes link that directory back to the host's, and export the host
+# path so aiq running inside a lane can still find it.
+if [ -n "${AIQ_HOST_CLAUDE:-}" ]; then
+  CLAUDE_HOST="$AIQ_HOST_CLAUDE"
+elif [ -n "$AIQ_IN_CLAUDE" ]; then
+  CLAUDE_HOST="$(dirname "$AIQ_DIR")/.claude"   # lanes export AIQ_DIR too
+else
+  CLAUDE_HOST="$CLAUDE_HOME"
+fi
+
 # ---------------------------------------------------------------- colours ---
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RST=$'\033[0m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'
@@ -664,6 +676,53 @@ def cmd_codex_usage(argv):
     print("ok\t1")
 
 
+def cmd_lane_projects(argv):
+    """src dst lane -> move a lane's transcripts into the shared store.
+
+    Two stores can hold a session file of the same name for the same project,
+    so a collision keeps both: the lane's copy is suffixed with its name rather
+    than overwriting the host's."""
+    import shutil
+    src, dst, lane = argv[0], argv[1], argv[2]
+    moved = left = 0
+    for proj in sorted(os.listdir(src)):
+        s = os.path.join(src, proj)
+        if not os.path.isdir(s):
+            left += 1
+            continue
+        t = os.path.join(dst, proj)
+        try:
+            os.makedirs(t, exist_ok=True)
+        except Exception:
+            left += 1
+            continue
+        for entry in sorted(os.listdir(s)):
+            a = os.path.join(s, entry)
+            b = os.path.join(t, entry)
+            if os.path.exists(b):
+                # An empty directory carries nothing worth a suffixed copy —
+                # Claude Code recreates these on demand.
+                if os.path.isdir(a) and not os.listdir(a):
+                    try:
+                        os.rmdir(a)
+                    except Exception:
+                        left += 1
+                    continue
+                stem, ext = os.path.splitext(entry)
+                b = os.path.join(t, "%s.lane-%s%s" % (stem, lane, ext))
+            try:
+                shutil.move(os.path.join(s, entry), b)
+                moved += 1
+            except Exception:
+                left += 1
+        try:
+            os.rmdir(s)
+        except Exception:
+            left += 1
+    print("moved\t%d" % moved)
+    print("left\t%d" % left)
+
+
 def cmd_dead(argv):
     """provider root -> names of profiles that can no longer be used"""
     provider, root = argv[0], argv[1]
@@ -675,7 +734,7 @@ def cmd_dead(argv):
 
 CMDS = {"dead": cmd_dead, "active": cmd_active, "list": cmd_list, "match": cmd_match, "resolve": cmd_resolve,
         "meta": cmd_meta, "slice": cmd_slice, "merge": cmd_merge, "cmp": cmd_cmp, "usage": cmd_usage,
-        "codex_usage": cmd_codex_usage}
+        "codex_usage": cmd_codex_usage, "lane_projects": cmd_lane_projects}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
@@ -1452,6 +1511,42 @@ _env_current_name() {
   return 0
 }
 
+_link_dir() {
+  # _link_dir <target> <link> — one directory serving two paths. On Windows a
+  # junction, which needs no admin rights and no developer mode; a symlink
+  # everywhere else.
+  local target="$1" link="$2"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      MSYS_NO_PATHCONV=1 cmd /c mklink /J "$(_np "$link")" "$(_np "$target")" \
+        >/dev/null 2>&1 ;;
+    *) ln -s "$target" "$link" 2>/dev/null ;;
+  esac
+}
+
+_lane_share_projects() {
+  # _lane_share_projects <lane-dir> <lane-name> — point the lane's transcripts
+  # at the host's, so `claude --continue` finds the same conversations whichever
+  # account recorded them. Only the credentials make a lane; the work does not.
+  local d="$1" name="$2" link shared out moved
+  [ "$PROV" = claude ] || return 0
+  link="$d/projects"; shared="$CLAUDE_HOST/projects"
+  [ -L "$link" ] && return 0
+  mkdir -p "$shared" 2>/dev/null || return 0
+  if [ -d "$link" ]; then
+    out="$(_py lane_projects "$(_np "$link")" "$(_np "$shared")" "$name" 2>/dev/null)"
+    moved="$(_field "$out" moved)"
+    [ "${moved:-0}" -gt 0 ] && warn "moved ${moved} transcript(s) from lane '$name' into $shared"
+    if ! rmdir "$link" 2>/dev/null; then
+      warn "lane '$name' still has files in $link — leaving its transcripts unshared"
+      return 0
+    fi
+  fi
+  _link_dir "$shared" "$link" || true
+  [ -L "$link" ] || warn "could not link $link -> $shared; lane '$name' keeps its own transcripts"
+  return 0
+}
+
 _env_paths() {
   # _env_paths <dir> -> sets EV_CRED / EV_SESS for that workspace
   if [ "$PROV" = claude ]; then EV_CRED="$1/.credentials.json"; EV_SESS="$1/.claude.json"
@@ -1507,11 +1602,15 @@ act_env_rm() {
 
 act_env() {
   # Print environment assignments for the current shell.
-  local name="${1:-}" fmt="${2:-}" d native aiq_native
+  local name="${1:-}" fmt="${2:-}" d native aiq_native host_native
   [ -z "$name" ] && die "usage: eval \"\$(aiq $PROV_CLI env <name>)\""
   d="$(_env_dir "$name")"
   [ -d "$d" ] || die "no workspace '$name' - create it with: aiq $PROV_CLI login $name"
   native="$(_np "$d")"; aiq_native="$(_np "$AIQ_DIR")"
+  host_native="$(_np "$CLAUDE_HOST")"
+  # Entering a lane is the moment to make sure it shares the host's transcripts.
+  # Anything printed from here must go to stderr: this output gets eval'd.
+  _lane_share_projects "$d" "$name"
   case "$fmt" in
     --powershell|--pwsh)
       printf '$env:%s = "%s"\n' "$P_ENVVAR" "$native"
@@ -1519,6 +1618,7 @@ act_env() {
         printf '$env:HOME = "%s"\n' "$native"
         printf '$env:USERPROFILE = "%s"\n' "$native"
         printf '$env:AIQ_DIR = "%s"\n' "$aiq_native"
+        printf '$env:AIQ_HOST_CLAUDE = "%s"\n' "$host_native"
       fi ;;
     --cmd)
       printf 'set %s=%s\n' "$P_ENVVAR" "$native"
@@ -1526,6 +1626,7 @@ act_env() {
         printf 'set HOME=%s\n' "$native"
         printf 'set USERPROFILE=%s\n' "$native"
         printf 'set AIQ_DIR=%s\n' "$aiq_native"
+        printf 'set AIQ_HOST_CLAUDE=%s\n' "$host_native"
       fi ;;
     --fish)
       printf 'set -x %s '\''%s'\''\n' "$P_ENVVAR" "$native"
@@ -1533,6 +1634,7 @@ act_env() {
         printf 'set -x HOME '\''%s'\''\n' "$d"
         printf 'set -x USERPROFILE '\''%s'\''\n' "$native"
         printf 'set -x AIQ_DIR '\''%s'\''\n' "$AIQ_DIR"
+        printf 'set -x AIQ_HOST_CLAUDE '\''%s'\''\n' "$CLAUDE_HOST"
       fi ;;
     *)
       printf 'export %s='\''%s'\''\n' "$P_ENVVAR" "$native"
@@ -1540,6 +1642,7 @@ act_env() {
         printf 'export HOME='\''%s'\''\n' "$d"
         printf 'export USERPROFILE='\''%s'\''\n' "$native"
         printf 'export AIQ_DIR='\''%s'\''\n' "$AIQ_DIR"
+        printf 'export AIQ_HOST_CLAUDE='\''%s'\''\n' "$CLAUDE_HOST"
       fi ;;
   esac
 }
@@ -1575,6 +1678,7 @@ act_run() {
     act_workspace "$profile_name" "$name" >/dev/null || die "could not create workspace '$name'"
   fi
   [ -d "$d" ] || die "account '$name' has no workspace"
+  _lane_share_projects "$d" "$name"
   info "scope: LANE \"$name\" (this command only) — your global account is untouched"
   [ "${1:-}" = "--" ] && shift
   if [ $# -eq 0 ] && [ -n "$resume" ]; then
@@ -1587,7 +1691,7 @@ act_run() {
   if [ $# -eq 0 ]; then set -- "$P_CLI"; fi
   native="$(_np "$d")"
   if [ "$PROV" = claude ]; then
-    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" "$@"
+    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$@"
   else
     env "$P_ENVVAR=$native" "$@"
   fi
@@ -1607,11 +1711,12 @@ act_login() {
   fi
   mkdir -p "$d" || die "could not create $d"
   _env_paths "$d"
+  _lane_share_projects "$d" "$name"
   native="$(_np "$d")"
   info "account: $name"
   [ "$PROV" = claude ] && info "sign in with /login once $P_CLI starts"
   if [ "$PROV" = claude ]; then
-    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" "$P_CLI"
+    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$P_CLI"
   else
     env "$P_ENVVAR=$native" "$P_CLI"
   fi
@@ -1822,6 +1927,15 @@ WORKSPACES - several accounts at the same time
   account untouched. `use` is GLOBAL scope: the one shared config every terminal
   reads. aiq prints a `scope:` line on every one so there is no guessing.
 
+  What a lane isolates is the LOGIN, not the WORK. Conversation transcripts live
+  in the config directory, so a lane of its own would hide every earlier session
+  and `claude --continue` would come up empty after a switch. aiq therefore
+  links each lane's projects/ directory to your real one (a junction on Windows,
+  a symlink elsewhere), so --continue and --resume see the same conversations
+  whichever account recorded them. Transcripts a lane recorded before this are
+  moved into the shared store the next time you enter it; if a session file name
+  is taken, the lane's copy is kept alongside as <name>.lane-<lane>.jsonl.
+
   aiq <p> login <name>          create an account, lane, and sign in
   aiq <p> envs                  list lanes, and which one this shell uses
   aiq <p> env <name>            print the line to put THIS shell in a lane
@@ -1943,7 +2057,8 @@ SCOPE - global switch vs. lane
     Points the CLI at an isolated config dir via one env var. Only this
     process is affected; other terminals and the global account do not move.
     Each lane refreshes its own token in place, so several can run at once.
-    Use this to run two accounts side by side.
+    Use this to run two accounts side by side. Conversation transcripts are
+    shared with the global config, so --continue works across both scopes.
 
   WHICH DO I RUN?
     just switch, everywhere ............... aiq <p> use <name>
