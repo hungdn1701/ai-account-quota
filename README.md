@@ -43,7 +43,7 @@ That is not a bug in the CLI. It is OAuth refresh-token rotation:
   command writes the live token back into the profile it belongs to *before*
   overwriting anything — so a rotated token can never be lost.
 
-Profiles are matched by **account identity** (`accountUuid` for Claude,
+Internally it matches accounts by stable identity (`accountUuid` for Claude,
 `chatgpt_account_id` for Codex), not by file hash. A file hash changes on every
 token refresh, which is why hash-based switchers lose track of which account is
 signed in.
@@ -72,49 +72,28 @@ locates Git Bash on its own; set `AIQ_BASH` to override it. It deliberately
 ignores `bash` on `PATH`, because that is usually WSL's bash, which cannot see
 the `~/.claude` and `~/.codex` your Windows CLIs actually use.
 
-## Run two accounts at once
+## Accounts and workspaces
 
-```sh
-aiq claude login work          # creates a workspace, signs in inside it
-aiq claude login personal      # a second, fully separate one
-aiq claude envs                # list them
-```
-
-Then, in two terminals:
-
-```sh
-# terminal A                            # terminal B
-eval "$(aiq claude env work)"           eval "$(aiq claude env personal)"
-claude                                  claude
-```
-
-Or without touching your shell:
-
-```sh
-aiq claude run work                     # runs `claude` in that workspace
-aiq claude run work -- claude -p "hi"   # or any command
-```
-
-PowerShell and fish are supported too:
+Use one account name everywhere. `aiq` keeps the saved profile and the isolated
+workspace under that same name, so normal commands need no `--workspace` flag.
 
 ```powershell
-Invoke-Expression (aiq claude env work --powershell)
+aiq claude login noob          # first login: creates and saves the account
+aiq claude use noob            # switch the global CLI to it
+aiq claude run noob            # run it in its isolated workspace
+aiq claude rename noob work    # rename profile and workspace together
+aiq claude ls                  # list accounts
 ```
 
-Already have accounts saved as profiles? Convert them without signing in again:
-
-```sh
-aiq claude adopt work
-```
-
-`login` refuses to sign in over a workspace that already holds an account, so a
-new login can never land on top of an existing one.
-
+Run another account in a second terminal with another `aiq <provider> run
+<account>` command. Existing `workspace`, `env`, and `--workspace` forms remain
+available for older setups.
 ## Switch a single account
 
 ```sh
 aiq claude save personal main    # save the signed-in account as a profile
 aiq claude use work              # switch
+aiq codex rename acc6 a6          # rename a saved profile; alias is kept
 aiq claude active                # who am I right now?
 ```
 
@@ -154,8 +133,8 @@ aiq claude restore old
 | status | meaning |
 |---|---|
 | `ok` | signed in and good |
-| `expiring` | Claude: refresh token has under 7 days left · Codex: subscription ends within 3 days |
-| `dead` | cannot authenticate any more — sign in again or archive it |
+| `expiring` | Claude: refresh token under 7 days left; Codex: subscription metadata is informational |
+| `dead` | no usable local credential; sign in again or log in again |
 
 For Claude, `dead` is driven by the **refresh** token (~27 day life), not the
 short-lived access token. An expired access token is normal; the CLI mints a new
@@ -168,9 +147,9 @@ aiq ls | quota | active            both providers
 aiq doctor                         environment check
 aiq <provider> <action> [args]     provider: claude (cl) · codex (cx)
 
-profiles     ls [--all|--archived] · use · save · active · quota · rm
+accounts     ls - login - save - use - run - rename - active - quota - rm
              archive · restore · prune [--yes] · sync
-workspaces   login · envs · env · run · adopt
+workspaces   login | envs | env | run | workspace (ws) | rename
 ```
 
 Built-in help explains when to use which:

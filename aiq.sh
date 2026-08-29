@@ -205,6 +205,9 @@ def codex_read(auth):
     d["plan"] = oai.get("chatgpt_plan_type") or ""
     d["sub_at"] = iso_local(oai.get("chatgpt_subscription_active_until"))
     d["sub_days"] = iso_days(oai.get("chatgpt_subscription_active_until"))
+    if d["plan"].lower() == "free":
+        d["sub_at"] = ""
+        d["sub_days"] = ""
     d["auth_mode"] = a.get("auth_mode") or ""
     d["refresh_at"] = iso_local(a.get("last_refresh"))
     exp = p.get("exp")
@@ -275,25 +278,21 @@ def profiles_of(root, archived=False):
 
 
 def health(provider, d):
-    """ok | expiring | dead | unknown — is this profile still usable?
-
-    Claude dies when the REFRESH token lapses (~27 days), not when the short
-    access token does; the CLI mints a new access token on every run.
-    Codex dies when the ChatGPT subscription window closes."""
-    v = d.get("refresh_days") if provider == "claude" else d.get("sub_days")
+    """ok | expiring | dead | unknown -- whether local auth is usable."""
+    if provider == "codex":
+        # Subscription metadata is not an authentication verdict. Free users
+        # can have an expired subscription timestamp and still use Codex.
+        return "ok" if d.get("has_cred") == "1" else "dead"
+    v = d.get("refresh_days")
     if v in (None, ""):
         return "unknown"
     try:
         f = float(v)
     except Exception:
         return "unknown"
-    # <= 0, not < 0: a window that has just closed comes through as -0.0, and
-    # -0.0 < 0 is False in Python, which reported a dead account as merely
-    # "expiring" while the days column already said expired.
     if f <= 0:
         return "dead"
-    return "expiring" if f < (7 if provider == "claude" else 3) else "ok"
-
+    return "expiring" if f < 7 else "ok"
 
 def active_of(argv):
     provider, cred = argv[0], argv[1]
@@ -317,16 +316,36 @@ def cmd_list(argv):
     _, acred, act = active_of([provider] + rest)
     aid, ahash = act.get("id", ""), sha(acred)
     base = os.path.join(root, ".archive") if arch else root
-
+    rows = []
     for name in profiles_of(root, archived=arch):
         d = prof_read(provider, os.path.join(base, name))
+        rows.append((name, d, sha(d["cred_path"])))
+
+    active_name = ""
+    if aid:
+        same = [item for item in rows if item[1].get("id") == aid]
+        exact = [item for item in same if item[2] == ahash]
+        if exact:
+            active_name = exact[0][0]
+        elif same:
+            active_name = same[0][0]
+    elif ahash:
+        exact = [item for item in rows if item[2] == ahash]
+        if exact:
+            active_name = exact[0][0]
+
+    for name, d, cred_hash in rows:
         mark, stale = " ", ""
-        if aid and d.get("id") and aid == d["id"]:
+        same_id = bool(aid and d.get("id") and aid == d["id"])
+        if name == active_name:
             mark = "*"
-            if sha(d["cred_path"]) != ahash:
+            if cred_hash != ahash:
                 mark, stale = "~", "1"
-        elif not aid and ahash and d.get("cred_path") and sha(d["cred_path"]) == ahash:
-            mark = "*"
+        elif same_id:
+            mark = "=" if cred_hash == ahash else "~"
+            stale = "1" if mark == "~" else ""
+        elif not aid and cred_hash == ahash:
+            mark = "="
         row(mark, name, d.get("alias") or "-", d.get("email") or "-", d.get("plan") or "-",
             d.get("token_days"), d.get("refresh_days"), d.get("q5h"), d.get("q7d"),
             stale, "1" if d.get("id") else "", d.get("sub_days"), d.get("saved_at"),
@@ -338,15 +357,22 @@ def cmd_match(argv):
     provider, root = argv[0], argv[1]
     _, acred, act = active_of([provider] + argv[2:])
     aid, ahash = act.get("id", ""), sha(acred)
+    candidates = []
     fallback = ""
     for name in profiles_of(root):
         d = prof_read(provider, os.path.join(root, name))
+        cred_hash = sha(d.get("cred_path", ""))
         if aid and d.get("id") and aid == d["id"]:
-            print(name)
-            return
-        if ahash and d.get("cred_path") and sha(d["cred_path"]) == ahash:
+            candidates.append((name, cred_hash))
+        if ahash and d.get("cred_path") and cred_hash == ahash:
             fallback = name
-    print(fallback)
+    exact = [name for name, cred_hash in candidates if cred_hash == ahash]
+    if exact:
+        print(exact[0])
+    elif candidates:
+        print(candidates[0][0])
+    else:
+        print(fallback)
 
 
 def cmd_resolve(argv):
@@ -566,6 +592,36 @@ _store() {
   return 0
 }
 
+_save_workspace() {
+  local workspace="$1" d="$2" src email
+  src="$(_env_dir "$workspace")"
+  [ -d "$src" ] || { warn "no workspace '$workspace' - see: aiq $PROV_CLI envs"; return 1; }
+  _env_paths "$src"
+  [ -f "$EV_CRED" ] || { warn "workspace '$workspace' is not signed in"; return 1; }
+  if [ "$PROV" = claude ]; then
+    [ -f "$EV_SESS" ] || { warn "workspace '$workspace' has no Claude session metadata"; return 1; }
+  fi
+  if _running; then
+    warn "a $P_LABEL process is running; close it before saving workspace '$workspace'"
+    return 1
+  fi
+  [ -f "$d/$P_CREDNAME" ] && _backup "$(_cred_in "$d")" "presave"
+  [ -f "$d/claude.json" ] && _backup "$d/claude.json" "presave"
+  mkdir -p "$d" || return 1
+  cp -f "$EV_CRED" "$d/$P_CREDNAME" || return 1
+  if [ "$PROV" = claude ]; then
+    _py slice "$(_np "$EV_SESS")" "$(_np "$d/claude.json")" || return 1
+    _py meta claude "$(_np "$d/$P_CREDNAME")" "$(_np "$d/claude.json")" \
+      "$(_np "$d/profile.json")" >/dev/null || return 1
+  else
+    _py meta codex "$(_np "$d/$P_CREDNAME")" "$(_np "$d/profile.json")" >/dev/null || return 1
+    _py active codex "$(_np "$d/$P_CREDNAME")" 2>/dev/null \
+      | awk -F'\t' '$1=="email" && $2!="" {print $2}' > "$d/profile.email"
+    [ -s "$d/profile.email" ] || rm -f "$d/profile.email"
+  fi
+  email="$(_field "$(_py active "$PROV" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null)" email)"
+  printf '%s' "$email"
+}
 _load() {
   # _load <profile-dir> — profile -> live account
   local d="$1" cred
@@ -600,6 +656,30 @@ _sync() {
   _store "$P_ROOT/$match" || return 1
   if [ "${1:-}" != quiet ] && ! cmp -s "$P_ACTIVE" "$cred" 2>/dev/null; then
     info "wrote the live token back into '$match' first"
+  fi
+  return 0
+}
+
+# An account that was never saved has no profile to be written back into, so
+# _sync cannot protect it and overwriting the auth file would lose it outright.
+# Give it a profile of its own first, named after the account, and say so.
+_rescue_unsaved() {
+  [ -f "$P_ACTIVE" ] || return 0
+  [ -n "$(_match)" ] && return 0          # already lives in a profile
+
+  local email name n=2
+  email="$(_field "$(_py active "$PROV" "${P_ARGS[@]}" 2>/dev/null)" email)"
+  name="$(printf '%s' "${email%%@*}" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+  [ -z "$name" ] && name="unsaved-$(date +%Y%m%d-%H%M%S)"
+  while [ -e "$P_ROOT/$name" ]; do name="${name%-[0-9]*}-$n"; n=$((n + 1)); done
+
+  if _store "$P_ROOT/$name"; then
+    printf '%ssaved the account you were signed in as%s %s%s%s%s\n' \
+      "$C_YEL" "$C_RST" "$C_B" "$name" "$C_RST" "${email:+  $email}"
+    info "  it had never been saved; without this it would have been lost here"
+  else
+    warn "could not save the current account - aborting the switch to be safe"
+    return 1
   fi
   return 0
 }
@@ -651,6 +731,7 @@ _list_one() {
     shown=1
     case "$mark" in
       '*') mcol="${C_GRN}* ${C_RST}" ;;
+      '=') mcol="${C_DIM}= ${C_RST}" ;;
       '~') mcol="${C_YEL}~ ${C_RST}" ;;
       *)   mcol="  " ;;
     esac
@@ -720,6 +801,48 @@ act_restore() {
   printf 'restored %s%s%s\n' "$C_B" "$key" "$C_RST"
 }
 
+act_rename() {
+  local from="${1:-}" to="${2:-}" profile_name existing_profile workspace_name=""
+  local profile_src profile_dst workspace_src workspace_dst has_profile=0 has_workspace=0
+  [ -n "$from" ] && [ -n "$to" ] || die "usage: aiq $PROV_CLI rename <old> <new>"
+  [ "$from" != "$to" ] || die "old and new account names are identical"
+  case "$to" in
+    .|..|*/*|*\\*) die "invalid account name '$to'" ;;
+  esac
+  profile_name="$(_py resolve "$(_np "$P_ROOT")" "$from" 2>/dev/null | head -n1)"
+  if [ -n "$profile_name" ] && [ -d "$P_ROOT/$profile_name" ]; then
+    has_profile=1
+    profile_src="$P_ROOT/$profile_name"
+    profile_dst="$P_ROOT/$to"
+  fi
+  if [ -d "$(_env_dir "$from")" ]; then
+    workspace_name="$from"
+  elif [ -n "$profile_name" ] && [ -d "$(_env_dir "$profile_name")" ]; then
+    workspace_name="$profile_name"
+  fi
+  if [ -n "$workspace_name" ]; then
+    has_workspace=1
+    workspace_src="$(_env_dir "$workspace_name")"
+    workspace_dst="$(_env_dir "$to")"
+  fi
+  [ "$has_profile" = 1 ] || [ "$has_workspace" = 1 ] || die "no account, profile, or workspace called '$from'"
+  existing_profile="$(_py resolve "$(_np "$P_ROOT")" "$to" 2>/dev/null | head -n1)"
+  [ -z "$existing_profile" ] || [ "$existing_profile" = "$profile_name" ] || die "account or alias '$to' already exists"
+  [ "$has_profile" = 0 ] || [ ! -e "$profile_dst" ] || die "profile '$to' already exists"
+  [ "$has_workspace" = 0 ] || [ ! -e "$workspace_dst" ] || die "workspace '$to' already exists"
+  [ "$has_workspace" = 0 ] || { [ "$(_env_current_name)" != "$workspace_name" ] || die "workspace '$workspace_name' is active in this shell"; }
+  [ "$has_workspace" = 0 ] || { _running && die "a $P_LABEL process is running; close it before renaming an account"; }
+  if [ "$has_profile" = 1 ]; then
+    mv "$profile_src" "$profile_dst" || die "could not rename profile '$profile_name'"
+  fi
+  if [ "$has_workspace" = 1 ]; then
+    if ! mv "$workspace_src" "$workspace_dst"; then
+      [ "$has_profile" = 0 ] || mv "$profile_dst" "$profile_src"
+      die "could not rename workspace '$workspace_name'"
+    fi
+  fi
+  printf 'account %s%s%s renamed to %s%s%s\n' "$C_B" "$from" "$C_RST" "$C_B" "$to" "$C_RST"
+}
 # prune only ever ARCHIVES. Deleting stays a separate, explicit `rm`.
 act_prune() {
   local yes="" name email count=0
@@ -753,14 +876,45 @@ act_prune() {
 }
 
 act_save() {
-  local name="${1:-}" alias="${2:-}" d email
-  [ -f "$P_ACTIVE" ] || die "not signed in — $P_ACTIVE does not exist"
+  local name="" alias="" workspace="" d email arg
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --workspace|-w)
+        [ "$#" -ge 2 ] || die "usage: aiq $PROV_CLI save <name> [alias] [--workspace <workspace>]"
+        workspace="$2"; shift 2 ;;
+      --*) die "unknown save option '$arg'" ;;
+      *)
+        if [ -z "$name" ]; then name="$arg"
+        elif [ -z "$alias" ]; then alias="$arg"
+        else die "usage: aiq $PROV_CLI save <name> [alias] [--workspace <workspace>]"; fi
+        shift ;;
+    esac
+  done
+  if [ -z "$name" ] && [ -n "$workspace" ]; then
+    die "usage: aiq $PROV_CLI save <name> [alias] --workspace <workspace>"
+  fi
+  [ -f "$P_ACTIVE" ] || [ -n "$workspace" ] || die "not signed in — $P_ACTIVE does not exist"
   if [ -z "$name" ]; then
     name="$(_match)"
     [ -z "$name" ] && die "usage: aiq $PROV_CLI save <name> [alias]"
     info "updating the profile that already holds this account: $name"
   fi
+  if [ -z "$workspace" ] && [ -n "$name" ]; then
+    local candidate="$name" resolved
+    resolved="$(_py resolve "$(_np "$P_ROOT")" "$name" 2>/dev/null | head -n1)"
+    [ -n "$resolved" ] && { candidate="$resolved"; name="$resolved"; }
+    _env_paths "$(_env_dir "$candidate")"
+    [ -f "$EV_CRED" ] && workspace="$candidate"
+  fi
   d="$P_ROOT/$name"
+  if [ -n "$workspace" ]; then
+    email="$(_save_workspace "$workspace" "$d")" || die "could not import workspace '$workspace'"
+    [ -n "$alias" ] && printf '%s\n' "$alias" > "$d/profile.alias"
+    printf '%ssaved%s %s%s%s%s%s\n' "$C_GRN" "$C_RST" "$C_B" "$name" "$C_RST" \
+      "${email:+  $email}" "  from workspace $workspace"
+    return 0
+  fi
   [ -d "$d" ] && _backup "$(_cred_in "$d")" "presave"
   _store "$d" || die "could not save profile '$name'"
   [ -n "$alias" ] && printf '%s\n' "$alias" > "$d/profile.alias"
@@ -773,8 +927,14 @@ act_use() {
   [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias>"
   name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
   [ -z "$name" ] && die "no profile or alias called '$key' — see: aiq $PROV_CLI ls"
+  if [ -z "$workspace" ] && [ -n "$name" ]; then
+    local candidate="$name" resolved
+    resolved="$(_py resolve "$(_np "$P_ROOT")" "$name" 2>/dev/null | head -n1)"
+    [ -n "$resolved" ] && { candidate="$resolved"; name="$resolved"; }
+    _env_paths "$(_env_dir "$candidate")"
+    [ -f "$EV_CRED" ] && workspace="$candidate"
+  fi
   d="$P_ROOT/$name"
-
   if _running; then
     warn "a $P_LABEL process is running. It keeps its token in memory and will"
     warn "rewrite the auth file when it exits, undoing this switch."
@@ -793,6 +953,7 @@ act_use() {
     return 0
   fi
 
+  _rescue_unsaved || exit 1
   _sync
   _backup "$P_ACTIVE" "preuse"
   [ "$PROV" = claude ] && _backup "$P_SESSION" "preuse"
@@ -821,7 +982,12 @@ act_active() {
   _sync quiet
   printf '%s%s%s\n' "$C_B" "$P_LABEL" "$C_RST"
   if [ ! -f "$P_ACTIVE" ]; then warn "not signed in ($P_ACTIVE missing)"; return 1; fi
+  local workspace; workspace="$(_env_current_name)"
+  if [ -n "$workspace" ]; then
+    printf '  %-13s %s\n' "workspace" "$workspace"
+  fi
   local name; name="$(_match)"
+  [ -n "$workspace" ] && name="workspace-only"
   printf '  %-13s %s\n' "profile" "${name:-<unsaved — run: aiq $PROV_CLI save <name>>}"
   _py active "$PROV" "${P_ARGS[@]}" 2>/dev/null \
     | awk -F'\t' '$2!="" && $1!~/^(has_cred|token_ms)$/ {printf "  %-13s %s\n",$1,$2}'
@@ -975,70 +1141,121 @@ act_envs() {
 }
 
 act_env() {
-  # Print the export line for the current shell. Meant for: eval "$(aiq claude env work)"
-  local name="${1:-}" fmt="${2:-}" d
+  # Print environment assignments for the current shell.
+  local name="${1:-}" fmt="${2:-}" d native aiq_native
   [ -z "$name" ] && die "usage: eval \"\$(aiq $PROV_CLI env <name>)\""
   d="$(_env_dir "$name")"
-  [ -d "$d" ] || die "no workspace '$name' — create it with: aiq $PROV_CLI login $name"
-  # Windows paths carry backslashes. Every form below is quoted so the
-  # receiving shell keeps them instead of eating them as escapes.
+  [ -d "$d" ] || die "no workspace '$name' - create it with: aiq $PROV_CLI login $name"
+  native="$(_np "$d")"; aiq_native="$(_np "$AIQ_DIR")"
   case "$fmt" in
-    --powershell|--pwsh) printf '$env:%s = "%s"\n' "$P_ENVVAR" "$(_np "$d")" ;;
-    --cmd)               printf 'set %s=%s\n' "$P_ENVVAR" "$(_np "$d")" ;;
-    --fish)              printf 'set -x %s '"'"'%s'"'"'\n' "$P_ENVVAR" "$(_np "$d")" ;;
-    *)                   printf 'export %s='"'"'%s'"'"'\n' "$P_ENVVAR" "$(_np "$d")" ;;
+    --powershell|--pwsh)
+      printf '$env:%s = "%s"\n' "$P_ENVVAR" "$native"
+      if [ "$PROV" = claude ]; then
+        printf '$env:HOME = "%s"\n' "$native"
+        printf '$env:USERPROFILE = "%s"\n' "$native"
+        printf '$env:AIQ_DIR = "%s"\n' "$aiq_native"
+      fi ;;
+    --cmd)
+      printf 'set %s=%s\n' "$P_ENVVAR" "$native"
+      if [ "$PROV" = claude ]; then
+        printf 'set HOME=%s\n' "$native"
+        printf 'set USERPROFILE=%s\n' "$native"
+        printf 'set AIQ_DIR=%s\n' "$aiq_native"
+      fi ;;
+    --fish)
+      printf 'set -x %s '\''%s'\''\n' "$P_ENVVAR" "$native"
+      if [ "$PROV" = claude ]; then
+        printf 'set -x HOME '\''%s'\''\n' "$d"
+        printf 'set -x USERPROFILE '\''%s'\''\n' "$native"
+        printf 'set -x AIQ_DIR '\''%s'\''\n' "$AIQ_DIR"
+      fi ;;
+    *)
+      printf 'export %s='\''%s'\''\n' "$P_ENVVAR" "$native"
+      if [ "$PROV" = claude ]; then
+        printf 'export HOME='\''%s'\''\n' "$d"
+        printf 'export USERPROFILE='\''%s'\''\n' "$native"
+        printf 'export AIQ_DIR='\''%s'\''\n' "$AIQ_DIR"
+      fi ;;
   esac
 }
-
 act_run() {
-  # Run a command with this workspace active. Defaults to the provider's CLI.
-  local name="${1:-}" d
-  [ -z "$name" ] && die "usage: aiq $PROV_CLI run <name> [command...]"
+  local key="${1:-}" name profile_name d native
+  [ -n "$key" ] || die "usage: aiq $PROV_CLI run <account> [command...]"
   shift
+  profile_name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+  if [ -n "$profile_name" ]; then
+    name="$profile_name"
+  elif [ -d "$(_env_dir "$key")" ]; then
+    name="$key"
+  else
+    die "no account '$key' - see: aiq $PROV_CLI ls or envs"
+  fi
   d="$(_env_dir "$name")"
-  [ -d "$d" ] || die "no workspace '$name' — create it with: aiq $PROV_CLI login $name"
+  if [ ! -d "$d" ] && [ -n "$profile_name" ]; then
+    info "creating workspace '$name' from profile '$profile_name'"
+    act_workspace "$profile_name" "$name" >/dev/null || die "could not create workspace '$name'"
+  fi
+  [ -d "$d" ] || die "account '$name' has no workspace"
   [ "${1:-}" = "--" ] && shift
   if [ $# -eq 0 ]; then set -- "$P_CLI"; fi
-  env "$P_ENVVAR=$(_np "$d")" "$@"
+  native="$(_np "$d")"
+  if [ "$PROV" = claude ]; then
+    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" "$@"
+  else
+    env "$P_ENVVAR=$native" "$@"
+  fi
 }
-
 act_login() {
-  # Create a workspace and run the CLI's own login flow *inside* it.
-  # A new account can only ever be written into the directory named here, so
-  # signing in can never land on top of an account that already exists.
-  local name="${1:-}" force="" d
-  [ -z "$name" ] && die "usage: aiq $PROV_CLI login <name> [--force]"
+  local name="${1:-}" force="" d native rc email
+  [ -z "$name" ] && die "usage: aiq $PROV_CLI login <account> [--force]"
   case "${2:-}" in -f|--force) force=1 ;; esac
   d="$(_env_dir "$name")"
-
   if [ -d "$d" ]; then
     _env_paths "$d"
     if [ -f "$EV_CRED" ] && [ -z "$force" ]; then
       local who; who="$(_field "$(_py active "$PROV" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null)" email)"
-      warn "workspace '$name' already holds an account${who:+ ($who)}."
-      warn "Signing in again would replace it. Pick another name, or pass --force."
-      die "refusing to overwrite workspace '$name'"
+      warn "account '$name' already holds ${who:-an account}. Pick another name, or pass --force."
+      die "refusing to overwrite account '$name'"
     fi
   fi
-
   mkdir -p "$d" || die "could not create $d"
   _env_paths "$d"
-
-  local inenv; inenv="$(_env_current_name)"
-  if [ -n "$inenv" ] && [ "$inenv" != "$name" ]; then
-    info "note: this shell is currently inside workspace '$inenv'; the login below"
-    info "      runs in '$name' regardless, because aiq sets $P_ENVVAR for that call only."
-  fi
-
-  info "workspace: $d"
+  native="$(_np "$d")"
+  info "account: $name"
   [ "$PROV" = claude ] && info "sign in with /login once $P_CLI starts"
-  env "$P_ENVVAR=$(_np "$d")" "$P_CLI"
+  if [ "$PROV" = claude ]; then
+    env "$P_ENVVAR=$native" HOME="$d" USERPROFILE="$native" AIQ_DIR="$AIQ_DIR" "$P_CLI"
+  else
+    env "$P_ENVVAR=$native" "$P_CLI"
+  fi
+  rc=$?
+  _env_paths "$d"
+  if [ -f "$EV_CRED" ]; then
+    email="$(_save_workspace "$name" "$P_ROOT/$name" 2>/dev/null)" || email=""
+    [ -n "$email" ] && info "saved account: $name  $email"
+  fi
+  return "$rc"
+}
+act_workspace_rename() {
+  local from="${1:-}" to="${2:-}" src dst current
+  [ -n "$from" ] && [ -n "$to" ] || die "usage: aiq $PROV_CLI workspace rename <old> <new>"
+  [ "$from" != "$to" ] || die "old and new workspace names are identical"
+  src="$(_env_dir "$from")"; dst="$(_env_dir "$to")"
+  [ -d "$src" ] || die "no workspace '$from' - see: aiq $PROV_CLI envs"
+  [ ! -e "$dst" ] || die "workspace '$to' already exists"
+  current="$(_env_current_name)"
+  [ "$current" != "$from" ] || die "workspace '$from' is active in this shell; open a new shell before renaming it"
+  if _running; then
+    warn "a $P_LABEL process is running; close it before renaming a workspace"
+    return 1
+  fi
+  mv "$src" "$dst" || die "could not rename workspace '$from'"
+  printf 'workspace %s%s%s renamed to %s%s%s\n' "$C_B" "$from" "$C_RST" "$C_B" "$to" "$C_RST"
 }
 
-act_adopt() {
-  # Copy a saved switch-profile into a workspace, so nothing has to be re-logged-in.
+act_workspace() {  # Copy a saved switch-profile into a workspace, so nothing has to be re-logged-in.
   local key="${1:-}" as="${2:-}" name d src
-  [ -z "$key" ] && die "usage: aiq $PROV_CLI adopt <profile|alias> [workspace-name]"
+  [ -z "$key" ] && die "usage: aiq $PROV_CLI workspace <profile|alias> [workspace-name]"
   name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
   [ -z "$name" ] && die "no profile or alias called '$key'"
   [ -z "$as" ] && as="$name"
@@ -1126,8 +1343,8 @@ START HERE
 COMMON TASKS
   Running out of quota          aiq quota           see which account has room
   Just signed into a new one    aiq <p> save <name>
-  Change the active account     aiq <p> use <name>
-  Use two accounts at once      aiq help workspaces
+  Change the active account     aiq <p> use <name>   saves the old one for you
+  Use two accounts at once      aiq <p> run <name>
   Forgot which account is live  aiq active
   Clean up dead accounts        aiq <p> prune       --yes archives them
   Something looks wrong         aiq doctor
@@ -1145,15 +1362,20 @@ AIQHELP
 
 help_profiles() {
   cat <<'AIQHELP'
-PROFILES - one active account at a time
+ACCOUNTS - one active account at a time
 
-  aiq <p> ls                    list saved profiles
+  aiq <p> ls                    list accounts
   aiq <p> ls --all              include archived ones
   aiq <p> save [name] [alias]   save the signed-in account.
-                                Without a name it updates whichever profile
-                                already holds this account.
-  aiq <p> use <name|alias>      switch to it
+  aiq <p> login <name>          create account + workspace, then sign in
+  aiq <p> use <name|alias>      switch to it. `switch` is the same command.
+                                The account you are leaving is always saved
+                                first - into its own profile, or into a new
+                                one if it had never been saved.
   aiq <p> active                show the signed-in account
+  aiq <p> run <name>            run it in its isolated workspace
+  aiq <p> rename <old> <new>   rename account and workspace together
+  ls markers: * active profile, = duplicate account, ~ stale snapshot
   aiq <p> rm <name|alias>       delete a profile (credentials backed up first)
   aiq <p> archive <name|alias>  hide it from ls, keep every file
   aiq <p> restore <name>        bring an archived profile back
@@ -1180,16 +1402,19 @@ help_workspaces() {
   cat <<'AIQHELP'
 WORKSPACES - several accounts at the same time
 
-  Nothing is copied here. Each account gets its own config directory and the CLI
-  is pointed at it with one environment variable, so two accounts can run in two
-  terminals at once and each refreshes its own token in place.
+  Each account has one name and one isolated config directory. Use `run` in
+  another terminal to run accounts side by side; use `use` to switch globally.
 
-  aiq <p> login <name>          create a workspace and sign in inside it
+  aiq <p> login <name>          create an account, workspace, and sign in
   aiq <p> envs                  list workspaces, and which one this shell uses
   aiq <p> env <name>            print the line to run in this shell
   aiq <p> run <name> [cmd...]   run a command in that workspace (default: the CLI)
-  aiq <p> adopt <profile>       turn a saved profile into a workspace,
-                                so you do not have to sign in again
+  aiq <p> workspace <profile>   legacy conversion; normally use `run` instead
+  aiq <p> workspace rename <old> <new>  legacy: rename workspace only
+
+  Import a workspace into a classic profile:
+    aiq claude save <profile> [alias] --workspace <workspace>
+    Close Claude first; the old profile is backed up automatically.
 
   Two terminals, two accounts
     # terminal A                        # terminal B
@@ -1232,8 +1457,8 @@ QUOTA AND STATUS
   STATUS
     ok         usable
     expiring   Claude: refresh token under 7 days left
-               Codex:  subscription ends within 3 days
-    dead       cannot authenticate any more - sign in again, or archive it
+               Codex: subscription metadata only; not authentication health
+    dead       no usable local credential; sign in again
     ?          not enough information (an old profile saved without identity;
                run `aiq <p> save <name>` while signed in as it to fix)
 
@@ -1308,7 +1533,7 @@ main() {
     case "$1" in
       # they typed an action but left out which CLI it applies to
       ls|list|use|switch|save|add|who|rm|remove|delete|archive|restore|prune|sync|\
-      login|new|envs|env|run|adopt)
+      login|new|envs|env|run|workspace|ws|import|adopt|rename|mv)
         printf '\ndid you mean:  aiq claude %s    (or: aiq codex %s)\n' "$1" "$1" >&2 ;;
       c|cl|cla*|anthropic*|antropic)
         printf '\ndid you mean:  aiq claude ...\n' >&2 ;;
@@ -1331,8 +1556,11 @@ main() {
     env)              act_env "${1:-}" "${2:-}" ;;
     run)              shift 0; act_run "$@" ;;
     login|new)        act_login "${1:-}" ;;
-    adopt)            act_adopt "${1:-}" "${2:-}" ;;
-    save|add)         act_save "${1:-}" "${2:-}" ;;
+    workspace|ws|import|adopt)
+      if [ "${1:-}" = rename ] || [ "${1:-}" = mv ]; then shift; act_workspace_rename "$@"
+      else act_workspace "${1:-}" "${2:-}"; fi ;;
+    rename|mv)         act_rename "$@" ;;
+    save|add)         act_save "$@" ;;
     active|who)       act_active ;;
     quota|usage)      act_quota ;;
     rm|remove|delete) act_rm "${1:-}" ;;
@@ -1346,7 +1574,7 @@ main() {
       fi ;;
     *)                printf '%saiq: %s has no action "%s"%s\n' "$C_RED" "$PROV_CLI" "$action" "$C_RST" >&2
                       printf '\ntry one of:\n  %s ls · use · save · active · quota · prune\n' "$PROV_CLI" >&2
-                      printf '  %s login · envs · env · run · adopt\n\n' "$PROV_CLI" >&2
+                      printf '  %s login | envs | env | run | workspace (ws) | rename\n\n' "$PROV_CLI"
                       printf 'full help:  aiq help\n' >&2
                       exit 1 ;;
   esac
