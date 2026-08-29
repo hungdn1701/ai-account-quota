@@ -1182,19 +1182,42 @@ act_save() {
 }
 
 act_use() {
-  local key="${1:-}" name d out email plan td rd same newer resume=""
-  [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias> [-c | --resume]"
+  local key="${1:-}" name d out email plan td rd same newer resume="" want=""
+  [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias> [--global] [-c|--resume]"
   shift
-  # An in-progress conversation lives in the transcript files and project
-  # history, none of which a switch touches — so after moving the account you
-  # can pick the session straight back up. -c/--resume does that in one step.
-  case "${1:-}" in
-    -c|--continue) resume=continue; shift ;;
-    --resume)      resume=resume; shift ;;
-  esac
+  # -c/--resume: an in-progress conversation lives in the transcript files and
+  # project history, neither of which a switch touches, so after moving the
+  # account you can pick the session straight back up — this does it in one step.
+  # --global: documents the scope (use is always global); --lane is rejected
+  # with a pointer to `run`, so a wrong mental model fails loudly not silently.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--continue) resume=continue ;;
+      --resume)      resume=resume ;;
+      -g|--global)   want=global ;;
+      -l|--lane)     want=lane ;;
+      --)            shift; break ;;
+      -*)            die "aiq $PROV_CLI use: unknown option '$1'" ;;
+      *)             die "aiq $PROV_CLI use: unexpected argument '$1' (name goes first)" ;;
+    esac
+    shift
+  done
+
+  # `use` is GLOBAL scope: it rewrites the one shared config every terminal
+  # reads. Inside an aiq lane shell the config dir AND the profile store are the
+  # lane's own, so `use` there would silently operate on the lane instead —
+  # refuse, and point at the tools that do fit. `run`/`env` are the lane verbs.
+  [ "$want" = lane ] && die "\`use\` only does global switches — there is no --lane mode. For a lane:  aiq $PROV_CLI run $key"
+  local lane; lane="$(_env_current_name)"
+  if [ -n "$lane" ]; then
+    die "this shell is inside lane \"$lane\"; \`use\` (global switch) does not apply here. Open a normal terminal for a global switch, or re-sign-in the lane with:  aiq $PROV_CLI login $lane --force"
+  fi
+
   name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
   [ -z "$name" ] && die "no profile or alias called '$key' — see: aiq $PROV_CLI ls"
   d="$P_ROOT/$name"
+  info "scope: GLOBAL — $name is now the $P_LABEL account for every terminal"
+
   if _running; then
     warn "a $P_LABEL process is running. It keeps its token in memory and will"
     warn "rewrite the auth file when it exits, undoing this switch."
@@ -1477,9 +1500,23 @@ act_env() {
   esac
 }
 act_run() {
-  local key="${1:-}" name profile_name d native
-  [ -n "$key" ] || die "usage: aiq $PROV_CLI run <account> [command...]"
+  local key="${1:-}" name profile_name d native resume=""
+  [ -n "$key" ] || die "usage: aiq $PROV_CLI run <account> [--lane] [-c|--resume] [-- command...]"
   shift
+  # Leading aiq flags, then everything else is the command to run in the lane.
+  # --lane is an explicit no-op: `run` is always a lane. -c/--resume launch the
+  # CLI straight into a continued/resumed conversation, inside the lane.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--continue) resume=continue ;;
+      --resume)      resume=resume ;;
+      --lane)        : ;;
+      -g|--global)   die "aiq $PROV_CLI run is always a lane. For a global switch:  aiq $PROV_CLI use $key" ;;
+      --)            shift; break ;;
+      *)             break ;;
+    esac
+    shift
+  done
   profile_name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
   if [ -n "$profile_name" ]; then
     name="$profile_name"
@@ -1494,7 +1531,15 @@ act_run() {
     act_workspace "$profile_name" "$name" >/dev/null || die "could not create workspace '$name'"
   fi
   [ -d "$d" ] || die "account '$name' has no workspace"
+  info "scope: LANE \"$name\" (this command only) — your global account is untouched"
   [ "${1:-}" = "--" ] && shift
+  if [ $# -eq 0 ] && [ -n "$resume" ]; then
+    if [ "$PROV" = claude ]; then
+      [ "$resume" = continue ] && set -- "$P_CLI" --continue || set -- "$P_CLI" --resume
+    else
+      [ "$resume" = continue ] && set -- "$P_CLI" resume --last || set -- "$P_CLI" resume
+    fi
+  fi
   if [ $# -eq 0 ]; then set -- "$P_CLI"; fi
   native="$(_np "$d")"
   if [ "$PROV" = claude ]; then
@@ -1639,13 +1684,19 @@ START HERE
   aiq quota                   how much of the plan each account has used
 
 COMMON TASKS
-  Running out of quota          aiq quota           see which account has room
+  Running out of quota          aiq quota            see which account has room
   Just signed into a new one    aiq <p> save <name>
-  Change the active account     aiq <p> use <name>   saves the old one for you
-  Use two accounts at once      aiq <p> run <name>
+  Change account everywhere     aiq <p> use <name>   GLOBAL: every terminal
+  Move this chat to another one aiq <p> use <name> -c  switch, then --continue
+  Use two accounts at once      aiq <p> run <name>   LANE: this terminal only
   Forgot which account is live  aiq active
-  Clean up dead accounts        aiq <p> prune       --yes archives them
+  Clean up dead accounts        aiq <p> prune        --yes archives them
   Something looks wrong         aiq doctor
+
+  SCOPE  use  = GLOBAL: one shared config, changes every terminal.
+         run / env = LANE: an isolated config, this terminal only.
+         Every one prints a `scope:` line, and asserting the wrong one
+         (use --lane, run --global) is a clean error, not a surprise.
 
 MORE HELP
   aiq help profiles     switching a single active account
@@ -1670,12 +1721,18 @@ ACCOUNTS - one active account at a time
                                 The account you are leaving is always saved
                                 first - into its own profile, or into a new
                                 one if it had never been saved.
-  aiq <p> use <name> -c         switch, then continue the current conversation
-  aiq <p> use <name> --resume   switch, then pick a conversation to resume
-                                (your transcripts and history survive a switch;
-                                 -c / --resume just save you the second command)
+                                Always GLOBAL scope: the one shared config every
+                                terminal reads. Prints a `scope:` line. Refused
+                                inside a lane shell (that config is separate).
+      --global                  assert it - a no-op that documents intent
+      -c | --continue           after switching, run `<cli> --continue`
+      --resume                  after switching, run `<cli> --resume` (a picker)
+                                Transcripts and history survive a switch, so the
+                                conversation just carries on under the new
+                                account - these flags only save you a command.
   aiq <p> active                show the signed-in account
-  aiq <p> run <name>            run it in its isolated workspace
+  aiq <p> run <name> [-c]       run it in an isolated lane (this command only);
+                                -c / --resume launch straight into the CLI
   aiq <p> rename <old> <new>   rename account and workspace together
   ls markers: * active profile, = duplicate account, ~ stale snapshot
   aiq <p> rm <name|alias>       delete a profile (credentials backed up first)
@@ -1704,13 +1761,18 @@ help_workspaces() {
   cat <<'AIQHELP'
 WORKSPACES - several accounts at the same time
 
-  Each account has one name and one isolated config directory. Use `run` in
-  another terminal to run accounts side by side; use `use` to switch globally.
+  Each account has one name and one isolated config directory (a "lane"). `run`
+  and `env` are LANE scope: this terminal only, other terminals and the global
+  account untouched. `use` is GLOBAL scope: the one shared config every terminal
+  reads. aiq prints a `scope:` line on every one so there is no guessing.
 
-  aiq <p> login <name>          create an account, workspace, and sign in
-  aiq <p> envs                  list workspaces, and which one this shell uses
-  aiq <p> env <name>            print the line to run in this shell
-  aiq <p> run <name> [cmd...]   run a command in that workspace (default: the CLI)
+  aiq <p> login <name>          create an account, lane, and sign in
+  aiq <p> envs                  list lanes, and which one this shell uses
+  aiq <p> env <name>            print the line to put THIS shell in a lane
+  aiq <p> run <name> [cmd...]   run a command in that lane (default: the CLI)
+      --lane                    explicit no-op; `run` is always a lane
+      -c | --continue           launch the CLI with `--continue`, in the lane
+      --resume                  launch the CLI with `--resume`, in the lane
   aiq <p> workspace <profile>   legacy conversion; normally use `run` instead
   aiq <p> workspace rename <old> <new>  legacy: rename workspace only
 

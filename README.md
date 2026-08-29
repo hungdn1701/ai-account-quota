@@ -88,11 +88,25 @@ aiq claude ls                  # list accounts
 Run another account in a second terminal with another `aiq <provider> run
 <account>` command. Existing `workspace`, `env`, and `--workspace` forms remain
 available for older setups.
+
+### Two scopes: global switch vs. lane
+
+| | scope | what it touches |
+|---|---|---|
+| `aiq <p> use <name>` | **GLOBAL** | the one shared `~/.<cli>` — every terminal follows |
+| `aiq <p> run <name>` / `env` | **LANE** | an isolated config dir — this terminal only |
+
+Every one of these prints a `scope:` line so you always know which you got.
+Asserting the wrong one is a clean error, not a surprise: `use --lane` and
+`run --global` both refuse and point you at the right command, and `use` inside
+a lane shell refuses outright.
+
 ## Switch a single account
 
 ```sh
 aiq claude save personal main    # save the signed-in account as a profile
-aiq claude use work              # switch
+aiq claude use work              # switch (GLOBAL — every terminal)
+aiq claude use work -c           # switch, then `claude --continue` the chat
 aiq codex rename acc6 a6          # rename a saved profile; alias is kept
 aiq claude active                # who am I right now?
 ```
@@ -102,7 +116,10 @@ up what it is about to overwrite, and refuses to run while a CLI session is open
 (that session would rewrite the auth file on exit and undo the switch).
 
 For Claude it copies only the *account* keys of `~/.claude.json` — your projects,
-MCP servers and history stay exactly where they are.
+MCP servers, history, and conversation transcripts stay exactly where they are,
+so a switched-to account can `--continue` / `--resume` the same conversation.
+`-c` / `--resume` on `use` (and `run`) just fold that second command into the
+switch.
 
 ## Check quota
 
