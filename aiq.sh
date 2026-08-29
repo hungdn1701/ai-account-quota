@@ -950,24 +950,34 @@ _list_one() {
 }
 
 _list_workspaces() {
-  local d name out email plan here shown=0
+  local d name out email plan here shown=0 cur seen=" " note prof
+  cur="$(_env_current_name)"
   for d in "$P_ENVROOT"/*/; do
     [ -d "$d" ] || continue
     _env_paths "${d%/}"
     [ -f "$EV_CRED" ] || continue
     [ "$shown" = 0 ] && {
-      printf '\n%sParallel workspaces%s\n' "$C_B" "$C_RST"
-      printf '%s  %-24s %-32s %-6s %s%s\n' "$C_DIM" "NAME" "ACCOUNT" "PLAN" "STATE" "$C_RST"
+      printf '\n%sLanes  (isolated; `run <name>` / `env <name>` — separate from the account above)%s\n' "$C_B" "$C_RST"
+      printf '%s  %-16s %-30s %-6s %s%s\n' "$C_DIM" "LANE" "ACCOUNT" "PLAN" "BELONGS TO" "$C_RST"
       shown=1
     }
     name="$(basename "${d%/}")"
     out="$(_py active "$PROV" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null)"
     email="$(_field "$out" email)"; plan="$(_field "$out" plan)"
-    here=""
-    [ "$name" = "$(_env_current_name)" ] && here="  <- this shell"
-    printf '  %-24s %-32.32s %-6.6s signed in%s\n' "$name" "${email:--}" "${plan:--}" "$here"
+    # Which saved profile is this the same account as? And is it a repeat?
+    prof="$(_py match "$PROV" "$(_np "$P_ROOT")" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null | head -n1)"
+    if [ -z "$prof" ]; then
+      note="${C_YEL}not saved — aiq $PROV_CLI save $name --workspace $name${C_RST}"
+    elif case "$seen" in *" $email "*) true ;; *) false ;; esac; then
+      note="${C_DIM}profile $prof (another lane already has this account)${C_RST}"
+    else
+      note="profile $prof"
+    fi
+    [ -n "$email" ] && seen="$seen$email "
+    here=""; [ "$name" = "$cur" ] && here="  ${C_CYA}<- this shell${C_RST}"
+    printf '  %-16.16s %-30.30s %-6.6s %b%b\n' "$name" "${email:--}" "${plan:--}" "$note" "$here"
   done
-  [ "$shown" = 1 ] && info "  run one with: aiq $PROV_CLI run <name>"
+  [ "$shown" = 1 ] && info "  enter: eval \"\$(aiq $PROV_CLI env <name>)\"  ·  one-off: aiq $PROV_CLI run <name>  ·  delete: aiq $PROV_CLI env rm <name>"
 }
 _reset_cell() {
   [ -n "$1" ] && printf '%16.16s' "$1" || printf '%16s' "-"
@@ -1037,8 +1047,8 @@ act_ls() {
                 _list_one --archived; return 0 ;;
   esac
   _list_one
+  info "  ^ profiles: what plain \`$P_CLI\` uses.  * = active now.  switch: aiq $PROV_CLI use <name>"
   _list_workspaces
-  info "  * = active global CLI; workspaces below are independent"
   if [ "$PROV" = claude ]; then
     info "  5H/7D here is Claude Code's own cache; for live numbers: aiq claude quota"
   else
