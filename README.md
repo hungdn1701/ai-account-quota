@@ -173,6 +173,18 @@ profiles     ls [--all|--archived] · use · save · active · quota · rm
 workspaces   login · envs · env · run · adopt
 ```
 
+Built-in help explains when to use which:
+
+```
+aiq help              start here - common tasks, in plain words
+aiq help profiles     switching a single active account
+aiq help workspaces   running several accounts side by side
+aiq help quota        usage numbers, and what STATUS means
+aiq help why          why copying auth files logs you out of your device
+aiq help all          everything
+aiq claude help       the two modes, for one provider
+```
+
 ## Where things live
 
 | path | what |

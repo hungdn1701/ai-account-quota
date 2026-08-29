@@ -1108,62 +1108,192 @@ act_both() {
 }
 
 usage() {
-  cat <<'USAGE'
-aiq — switch Claude Code / Codex CLI accounts, and read their quota
+  cat <<'AIQHELP'
+aiq - run and switch between several Claude Code / Codex CLI accounts
 
-  aiq ls | quota | active           both providers at once
-  aiq doctor                        environment check
-  aiq <provider> <action> [args]
-
-providers   claude (cl)    codex (cx)
-
-actions
-  ls                      list profiles: account, plan, token life, quota
-  use   <name|alias>      switch to a profile
-  save  [name] [alias]    save the signed-in account; without a name it updates
-                          the profile that already holds this account
-  active                  show the signed-in account
-  quota                   usage against plan limits
-  rm    <name|alias>      delete a profile (credentials are backed up first)
-  archive <name|alias>    move a profile aside — kept on disk, hidden from ls
-  restore <name>          bring an archived profile back
-  prune [--yes]           show profiles that can no longer authenticate;
-                          --yes archives them (never deletes)
-  sync                    force the write-back described below
-
-  ls also takes --all or --archived.
-
-run two accounts at once (no switching involved)
-  login <name>            create a workspace and sign in inside it
-  envs                    list workspaces
-  env   <name>            print the export line for this shell
-  run   <name> [cmd...]   run a command (default: the CLI) in that workspace
-  adopt <profile> [name]  turn an existing saved profile into a workspace
-
-  # terminal A                        # terminal B
-  eval "$(aiq claude env work)"       eval "$(aiq claude env personal)"
-  claude                              claude
-
-  Each workspace is its own config directory, so both CLIs refresh their own
-  tokens in place and neither can overwrite the other. `login` refuses to sign
-  in over a workspace that already holds an account unless you pass --force.
-
-examples
-  aiq claude save a1 personal
-  aiq codex use work
-  aiq ls
-
-Before anything that overwrites an auth file, aiq writes the live token back into
-the profile it belongs to. That is what stops a rotated refresh token from being
-lost — the mistake that gets your device de-authorised. AIQ_FORCE=1 switches even
-while a CLI is running (not recommended).
 USAGE
+  aiq <provider> <action> [args]      provider:  claude (cl)  |  codex (cx)
+  aiq ls | quota | active | doctor    both providers at once
+
+START HERE
+  aiq doctor                  check the setup and see where files live
+  aiq ls                      which accounts exist, which one is in use
+  aiq claude save main        remember the account you are signed in as
+                              ^ do this first: an account you have not saved
+                                is lost the moment you switch away from it
+  aiq quota                   how much of the plan each account has used
+
+COMMON TASKS
+  Running out of quota          aiq quota           see which account has room
+  Just signed into a new one    aiq <p> save <name>
+  Change the active account     aiq <p> use <name>
+  Use two accounts at once      aiq help workspaces
+  Forgot which account is live  aiq active
+  Clean up dead accounts        aiq <p> prune       --yes archives them
+  Something looks wrong         aiq doctor
+
+MORE HELP
+  aiq help profiles     switching a single active account
+  aiq help workspaces   running several accounts side by side
+  aiq help quota        usage numbers, and what STATUS means
+  aiq help why          why copying auth files logs you out of your device
+  aiq help all          all of the above
+
+Docs: https://github.com/hungdn1701/ai-account-quota
+AIQHELP
+}
+
+help_profiles() {
+  cat <<'AIQHELP'
+PROFILES - one active account at a time
+
+  aiq <p> ls                    list saved profiles
+  aiq <p> ls --all              include archived ones
+  aiq <p> save [name] [alias]   save the signed-in account.
+                                Without a name it updates whichever profile
+                                already holds this account.
+  aiq <p> use <name|alias>      switch to it
+  aiq <p> active                show the signed-in account
+  aiq <p> rm <name|alias>       delete a profile (credentials backed up first)
+  aiq <p> archive <name|alias>  hide it from ls, keep every file
+  aiq <p> restore <name>        bring an archived profile back
+  aiq <p> prune [--yes]         list profiles that can no longer authenticate;
+                                --yes archives them, and never deletes
+  aiq <p> sync                  force the write-back below
+
+  Example
+    aiq claude save work team     # save the current account as "work"
+    aiq claude use team           # come back to it later by alias
+
+  Before anything that overwrites an auth file, aiq copies the live token back
+  into the profile it belongs to, and backs up what it is about to replace
+  (~/.aiq/backups). It refuses to switch while the CLI is running, because that
+  session rewrites the auth file when it exits and would undo the switch; pass
+  AIQ_FORCE=1 if you really mean to.
+
+  For Claude only the account keys of ~/.claude.json are carried across. Your
+  projects, MCP servers and history stay where they are.
+AIQHELP
+}
+
+help_workspaces() {
+  cat <<'AIQHELP'
+WORKSPACES - several accounts at the same time
+
+  Nothing is copied here. Each account gets its own config directory and the CLI
+  is pointed at it with one environment variable, so two accounts can run in two
+  terminals at once and each refreshes its own token in place.
+
+  aiq <p> login <name>          create a workspace and sign in inside it
+  aiq <p> envs                  list workspaces, and which one this shell uses
+  aiq <p> env <name>            print the line to run in this shell
+  aiq <p> run <name> [cmd...]   run a command in that workspace (default: the CLI)
+  aiq <p> adopt <profile>       turn a saved profile into a workspace,
+                                so you do not have to sign in again
+
+  Two terminals, two accounts
+    # terminal A                        # terminal B
+    eval "$(aiq claude env work)"       eval "$(aiq claude env personal)"
+    claude                              claude
+
+  One-off, without changing your shell
+    aiq claude run work
+    aiq claude run work -- claude -p "summarise this"
+
+  PowerShell           Invoke-Expression (aiq claude env work --powershell)
+  fish                 aiq claude env work --fish | source
+
+  login refuses to sign in over a workspace that already holds an account,
+  so a new login can never land on top of an existing one. Use --force to
+  override, or just pick another name.
+AIQHELP
+}
+
+help_quota() {
+  cat <<'AIQHELP'
+QUOTA AND STATUS
+
+  aiq quota            both providers
+  aiq <p> quota        per profile
+
+  For Claude this asks Anthropic directly - the same source as the /usage screen
+  in Claude Code - for every saved profile, so you can see which account still
+  has room BEFORE switching to it. It is a read-only call and never refreshes a
+  token. Profiles whose access token has already expired are skipped, since the
+  call cannot succeed. AIQ_OFFLINE=1 uses the last saved snapshot instead.
+
+  The 5H/7D columns in `ls` come from Claude Code's own cache, which it only
+  updates when you open /usage. Anything older than 6 hours is left blank rather
+  than shown as a stale number. Use `aiq claude quota` for live figures.
+
+  Codex publishes no usage counters locally, so it reports the plan and the
+  subscription window instead.
+
+  STATUS
+    ok         usable
+    expiring   Claude: refresh token under 7 days left
+               Codex:  subscription ends within 3 days
+    dead       cannot authenticate any more - sign in again, or archive it
+    ?          not enough information (an old profile saved without identity;
+               run `aiq <p> save <name>` while signed in as it to fix)
+
+  For Claude, dead is decided by the REFRESH token, which lives about 27 days -
+  not by the access token. An expired access token is normal: the CLI mints a
+  new one every run.
+AIQHELP
+}
+
+help_why() {
+  cat <<'AIQHELP'
+WHY THIS EXISTS
+
+  Copying .credentials.json or auth.json around to change accounts keeps logging
+  you out of your device, while staying on one account never does. That is not a
+  bug in the CLI. It is OAuth refresh-token rotation:
+
+    1. You restore account A's saved auth file and start working.
+    2. The CLI refreshes A's token. The provider issues a NEW refresh token and
+       invalidates the old one. Your saved copy is now stale.
+    3. You switch to B without saving A first. A's newest token is overwritten
+       and gone.
+    4. Later you restore A's stale copy. The provider sees a spent refresh token
+       being replayed - the signature of a stolen token - and revokes the whole
+       family. You are asked to sign in on this device again.
+
+  aiq answers this twice over:
+
+    - workspaces never copy anything, so the problem cannot arise (recommended)
+    - switching writes the live token back into its own profile first, so the
+      rotated token is never the one that gets lost
+
+  It also matches profiles by account identity (accountUuid for Claude,
+  chatgpt_account_id for Codex) rather than by file hash. A hash changes on every
+  refresh, which is why hash-based switchers lose track of who is signed in.
+AIQHELP
+}
+
+help_topic() {
+  case "${1:-}" in
+    profile|profiles|switch)      help_profiles ;;
+    workspace|workspaces|env|envs|parallel) help_workspaces ;;
+    quota|usage|status)           help_quota ;;
+    why|background|trap)          help_why ;;
+    all)
+      usage; printf '\n'; help_profiles; printf '\n'; help_workspaces
+      printf '\n'; help_quota; printf '\n'; help_why ;;
+    ""|help)                      usage ;;
+    *)
+      printf 'no help topic "%s"\n\n' "$1" >&2
+      printf 'topics: profiles · workspaces · quota · why · all\n' >&2
+      return 1 ;;
+  esac
 }
 
 # ------------------------------------------------------------------- main ---
 main() {
   case "${1:-}" in
-    ""|-h|--help|help) usage; return 0 ;;
+    ""|-h|--help)      usage; return 0 ;;
+    help)              help_topic "${2:-}"; return $? ;;
     -V|--version)      printf 'aiq %s\n' "$AIQ_VERSION"; return 0 ;;
     doctor)            act_doctor; return 0 ;;
     ls|list)           AIQ_LS_FLAG="${2:-}"; act_both ls; return 0 ;;
@@ -1171,7 +1301,24 @@ main() {
     active|status|who) act_both active; return 0 ;;
   esac
 
-  _set_provider "$1" || die "unknown provider '$1' — expected claude or codex (see: aiq --help)"
+  if ! _set_provider "$1"; then
+    printf '%saiq: "%s" is not a provider or a command%s\n\n' "$C_RED" "$1" "$C_RST" >&2
+    printf 'providers:  claude (cl)   codex (cx)\n' >&2
+    printf 'commands:   ls · quota · active · doctor · help\n' >&2
+    case "$1" in
+      # they typed an action but left out which CLI it applies to
+      ls|list|use|switch|save|add|who|rm|remove|delete|archive|restore|prune|sync|\
+      login|new|envs|env|run|adopt)
+        printf '\ndid you mean:  aiq claude %s    (or: aiq codex %s)\n' "$1" "$1" >&2 ;;
+      c|cl|cla*|anthropic*|antropic)
+        printf '\ndid you mean:  aiq claude ...\n' >&2 ;;
+      co|cod*|cx*|gpt*|chat*|open*)
+        printf '\ndid you mean:  aiq codex ...\n' >&2 ;;
+      *)
+        printf '\nfull help:  aiq help\n' >&2 ;;
+    esac
+    exit 1
+  fi
   PROV_CLI="$1"; shift
   local action="${1:-ls}"; [ $# -gt 0 ] && shift
   case "$action" in
@@ -1190,7 +1337,18 @@ main() {
     quota|usage)      act_quota ;;
     rm|remove|delete) act_rm "${1:-}" ;;
     sync)             _sync ;;
-    *)                die "unknown action '$action' — see: aiq --help" ;;
+    help|-h|--help)
+      if [ -n "${1:-}" ]; then
+        help_topic "$1"
+      else
+        help_profiles; printf '\n'; help_workspaces
+        printf '\nAlso: aiq help quota · aiq help why · aiq help all\n'
+      fi ;;
+    *)                printf '%saiq: %s has no action "%s"%s\n' "$C_RED" "$PROV_CLI" "$action" "$C_RST" >&2
+                      printf '\ntry one of:\n  %s ls · use · save · active · quota · prune\n' "$PROV_CLI" >&2
+                      printf '  %s login · envs · env · run · adopt\n\n' "$PROV_CLI" >&2
+                      printf 'full help:  aiq help\n' >&2
+                      exit 1 ;;
   esac
 }
 
