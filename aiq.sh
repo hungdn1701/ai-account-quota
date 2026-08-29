@@ -168,10 +168,19 @@ def claude_read(cred, session):
 
     cu = s.get("cachedUsageUtilization") or {}
     u = cu.get("utilization") or {}
+    # Claude Code only refreshes this cache when its /usage screen is opened, so
+    # it goes stale quickly. Reporting a stale 0% is worse than reporting nothing:
+    # past the cutoff we show blank and let `aiq quota` fetch the live figure.
+    fresh = True
+    try:
+        fresh = (time.time() - int(cu.get("fetchedAtMs")) / 1000) < float(
+            os.environ.get("AIQ_CACHE_MAX_AGE", "21600"))
+    except Exception:
+        fresh = False
     for key, tag in (("five_hour", "q5h"), ("seven_day", "q7d")):
         b = u.get(key) or {}
         v = b.get("utilization")
-        d[tag] = "" if v is None else str(v)
+        d[tag] = "" if (v is None or not fresh) else str(v)
         d[tag + "_reset"] = iso_local(b.get("resets_at"))
     d["q_at"] = ms_local(cu.get("fetchedAtMs"))
     d["sub_at"] = ""
@@ -669,6 +678,7 @@ act_ls() {
                 _list_one --archived; return 0 ;;
   esac
   _list_one
+  [ "$PROV" = claude ] && info "  5H/7D here is Claude Code's own cache; for live numbers: aiq claude quota"
   local nd; nd="$(_py dead "$PROV" "$(_np "$P_ROOT")" 2>/dev/null | wc -l | tr -d ' ')"
   [ "${nd:-0}" -gt 0 ] && info "  $nd unusable profile(s) — review with: aiq $PROV_CLI prune"
   return 0
