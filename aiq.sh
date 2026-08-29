@@ -55,6 +55,16 @@ fi
 # The host's own .claude.json sits beside its config dir, not inside it.
 CLAUDE_HOST_SESSION="$(dirname "$CLAUDE_HOST")/.claude.json"
 
+# Codex has the same split: everything lives under CODEX_HOME, so a lane keeps
+# its own conversation history, skills and plugins unless we say otherwise.
+if [ -n "${AIQ_HOST_CODEX:-}" ]; then
+  CODEX_HOST="$AIQ_HOST_CODEX"
+elif [ -n "$AIQ_IN_CODEX" ]; then
+  CODEX_HOST="$(dirname "$AIQ_DIR")/.codex"
+else
+  CODEX_HOST="$CODEX_HOME"
+fi
+
 # ---------------------------------------------------------------- colours ---
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RST=$'\033[0m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'
@@ -789,7 +799,7 @@ _py() {
 
 # -------------------------------------------------------------- provider ---
 PROV=""; P_ACTIVE=""; P_SESSION=""; P_ROOT=""; P_CREDNAME=""; P_LABEL=""; PROV_CLI=""
-P_ENVROOT=""; P_ENVVAR=""; P_CLI=""
+P_ENVROOT=""; P_ENVVAR=""; P_CLI=""; P_HOST=""
 declare -a P_ARGS=()
 
 _set_provider() {
@@ -797,11 +807,11 @@ _set_provider() {
     claude|cl|anthropic)
       PROV=claude; P_ACTIVE="$CLAUDE_CRED"; P_SESSION="$CLAUDE_SESSION"
       P_ROOT="$CLAUDE_PROFILES"; P_CREDNAME=".credentials.json"; P_LABEL="Claude Code"
-      P_ENVVAR="CLAUDE_CONFIG_DIR"; P_CLI="claude" ;;
+      P_ENVVAR="CLAUDE_CONFIG_DIR"; P_CLI="claude"; P_HOST="$CLAUDE_HOST" ;;
     codex|cx|gpt|chatgpt|openai)
       PROV=codex; P_ACTIVE="$CODEX_AUTH"; P_SESSION=""
       P_ROOT="$CODEX_PROFILES"; P_CREDNAME="auth.json"; P_LABEL="Codex CLI"
-      P_ENVVAR="CODEX_HOME"; P_CLI="codex" ;;
+      P_ENVVAR="CODEX_HOME"; P_CLI="codex"; P_HOST="$CODEX_HOST" ;;
     *) return 1 ;;
   esac
   P_ENVROOT="$AIQ_ENVS/$PROV"
@@ -1564,26 +1574,54 @@ _link_dir() {
   esac
 }
 
-_lane_share_projects() {
-  # _lane_share_projects <lane-dir> <lane-name> — point the lane's transcripts
-  # at the host's, so `claude --continue` finds the same conversations whichever
-  # account recorded them. Only the credentials make a lane; the work does not.
-  local d="$1" name="$2" link shared out moved
-  [ "$PROV" = claude ] || return 0
-  link="$d/projects"; shared="$CLAUDE_HOST/projects"
+_lane_link() {
+  # _lane_link <lane-dir> <lane-name> <subdir> <merge|park> — make one directory
+  # inside a lane be the host's directory instead of a copy.
+  #   merge  transcripts: the lane's own recordings are real work, so they are
+  #          moved into the shared store before the link replaces the directory.
+  #   park   skills and plugins: whatever a lane has there is a re-downloaded
+  #          cache, so it is set aside rather than merged by rules we'd invent.
+  local d="$1" name="$2" sub="$3" mode="$4" link shared out moved parked
+  link="$d/$sub"; shared="$P_HOST/$sub"
   [ -L "$link" ] && return 0
+  [ "$link" = "$shared" ] && return 0
   mkdir -p "$shared" 2>/dev/null || return 0
   if [ -d "$link" ]; then
-    out="$(_py lane_projects "$(_np "$link")" "$(_np "$shared")" "$name" 2>/dev/null)"
-    moved="$(_field "$out" moved)"
-    [ "${moved:-0}" -gt 0 ] && warn "moved ${moved} transcript(s) from lane '$name' into $shared"
-    if ! rmdir "$link" 2>/dev/null; then
-      warn "lane '$name' still has files in $link — leaving its transcripts unshared"
-      return 0
+    if [ "$mode" = merge ]; then
+      out="$(_py lane_projects "$(_np "$link")" "$(_np "$shared")" "$name" 2>/dev/null)"
+      moved="$(_field "$out" moved)"
+      [ "${moved:-0}" -gt 0 ] && warn "moved ${moved} transcript(s) from lane '$name' into $shared"
+      rmdir "$link" 2>/dev/null
+    elif [ -n "$(ls -A "$link" 2>/dev/null)" ]; then
+      parked="$link.lane-backup"
+      [ -e "$parked" ] || { mv "$link" "$parked" 2>/dev/null && \
+        warn "set aside lane '$name' $sub/ as $(basename "$parked") — now sharing yours"; }
+    else
+      rmdir "$link" 2>/dev/null
     fi
   fi
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    warn "lane '$name' still has its own $sub/ — leaving it unshared"
+    return 0
+  fi
   _link_dir "$shared" "$link" || true
-  [ -L "$link" ] || warn "could not link $link -> $shared; lane '$name' keeps its own transcripts"
+  [ -L "$link" ] || warn "could not link $link -> $shared; lane '$name' keeps its own $sub/"
+  return 0
+}
+
+_lane_share_projects() {
+  # Only the credentials make a lane; the work does not. Share the directories
+  # that hold work — conversations, skills, plugins — with the host.
+  local d="$1" name="$2"
+  if [ "$PROV" = claude ]; then
+    _lane_link "$d" "$name" projects merge
+  else
+    # Codex keeps legacy rollout transcripts here; the newer thread history is
+    # SQLite, which CODEX_SQLITE_HOME points at the host instead.
+    _lane_link "$d" "$name" sessions merge
+  fi
+  _lane_link "$d" "$name" skills park
+  _lane_link "$d" "$name" plugins park
   return 0
 }
 
@@ -1663,36 +1701,35 @@ act_env() {
   d="$(_env_dir "$name")"
   [ -d "$d" ] || die "no workspace '$name' - create it with: aiq $PROV_CLI login $name"
   native="$(_np "$d")"; aiq_native="$(_np "$AIQ_DIR")"
-  host_native="$(_np "$CLAUDE_HOST")"
-  # Entering a lane is the moment to make sure it shares the host's transcripts.
+  host_native="$(_np "$P_HOST")"
+  # Entering a lane is the moment to make sure it shares the host's work dirs.
   # Anything printed from here must go to stderr: this output gets eval'd.
   _lane_share_projects "$d" "$name"
   _lane_seed_projects "$d"
+  # One list, four dialects. The CLIs are native binaries so their own variables
+  # are always native paths; the AIQ_* ones are read back by this script, which
+  # wants POSIX paths in a POSIX shell.
+  local -a kn=() ku=() kv=()
+  kn+=("$P_ENVVAR");         ku+=("$native");      kv+=("$native")
+  kn+=(AIQ_DIR);             ku+=("$AIQ_DIR");     kv+=("$aiq_native")
+  if [ "$PROV" = claude ]; then
+    kn+=(AIQ_HOST_CLAUDE);   ku+=("$P_HOST");      kv+=("$host_native")
+  else
+    # Codex keeps conversation history in SQLite under this directory rather
+    # than in the config dir, so it is pointed at the host's separately.
+    kn+=(CODEX_SQLITE_HOME); ku+=("$host_native"); kv+=("$host_native")
+    kn+=(AIQ_HOST_CODEX);    ku+=("$P_HOST");      kv+=("$host_native")
+  fi
+  local i
   case "$fmt" in
     --powershell|--pwsh)
-      printf '$env:%s = "%s"\n' "$P_ENVVAR" "$native"
-      if [ "$PROV" = claude ]; then
-        printf '$env:AIQ_DIR = "%s"\n' "$aiq_native"
-        printf '$env:AIQ_HOST_CLAUDE = "%s"\n' "$host_native"
-      fi ;;
+      for i in "${!kn[@]}"; do printf '$env:%s = "%s"\n' "${kn[$i]}" "${kv[$i]}"; done ;;
     --cmd)
-      printf 'set %s=%s\n' "$P_ENVVAR" "$native"
-      if [ "$PROV" = claude ]; then
-        printf 'set AIQ_DIR=%s\n' "$aiq_native"
-        printf 'set AIQ_HOST_CLAUDE=%s\n' "$host_native"
-      fi ;;
+      for i in "${!kn[@]}"; do printf 'set %s=%s\n' "${kn[$i]}" "${kv[$i]}"; done ;;
     --fish)
-      printf 'set -x %s '\''%s'\''\n' "$P_ENVVAR" "$native"
-      if [ "$PROV" = claude ]; then
-        printf 'set -x AIQ_DIR '\''%s'\''\n' "$AIQ_DIR"
-        printf 'set -x AIQ_HOST_CLAUDE '\''%s'\''\n' "$CLAUDE_HOST"
-      fi ;;
+      for i in "${!kn[@]}"; do printf 'set -x %s '\''%s'\''\n' "${kn[$i]}" "${ku[$i]}"; done ;;
     *)
-      printf 'export %s='\''%s'\''\n' "$P_ENVVAR" "$native"
-      if [ "$PROV" = claude ]; then
-        printf 'export AIQ_DIR='\''%s'\''\n' "$AIQ_DIR"
-        printf 'export AIQ_HOST_CLAUDE='\''%s'\''\n' "$CLAUDE_HOST"
-      fi ;;
+      for i in "${!kn[@]}"; do printf 'export %s='\''%s'\''\n' "${kn[$i]}" "${ku[$i]}"; done ;;
   esac
 }
 act_run() {
@@ -1743,7 +1780,8 @@ act_run() {
   if [ "$PROV" = claude ]; then
     env "$P_ENVVAR=$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$@"
   else
-    env "$P_ENVVAR=$native" "$@"
+    env "$P_ENVVAR=$native" CODEX_SQLITE_HOME="$(_np "$CODEX_HOST")" \
+        AIQ_DIR="$AIQ_DIR" AIQ_HOST_CODEX="$CODEX_HOST" "$@"
   fi
 }
 act_login() {
@@ -1769,7 +1807,8 @@ act_login() {
   if [ "$PROV" = claude ]; then
     env "$P_ENVVAR=$native" AIQ_DIR="$AIQ_DIR" AIQ_HOST_CLAUDE="$CLAUDE_HOST" "$P_CLI"
   else
-    env "$P_ENVVAR=$native" "$P_CLI"
+    env "$P_ENVVAR=$native" CODEX_SQLITE_HOME="$(_np "$CODEX_HOST")" \
+        AIQ_DIR="$AIQ_DIR" AIQ_HOST_CODEX="$CODEX_HOST" "$P_CLI"
   fi
   rc=$?
   _env_paths "$d"
@@ -1978,21 +2017,34 @@ WORKSPACES - several accounts at the same time
   account untouched. `use` is GLOBAL scope: the one shared config every terminal
   reads. aiq prints a `scope:` line on every one so there is no guessing.
 
-  What a lane isolates is the LOGIN, not the WORK. Conversation transcripts live
-  in the config directory, so a lane of its own would hide every earlier session
-  and `claude --continue` would come up empty after a switch. aiq therefore
-  links each lane's projects/ directory to your real one (a junction on Windows,
-  a symlink elsewhere), so --continue and --resume see the same conversations
-  whichever account recorded them. Transcripts a lane recorded before this are
-  moved into the shared store the next time you enter it; if a session file name
-  is taken, the lane's copy is kept alongside as <name>.lane-<lane>.jsonl.
+  What a lane isolates is the LOGIN, not the WORK. Both CLIs keep conversations,
+  skills and plugins inside the config directory, so a lane of its own would
+  hide all of it and `--continue` / `resume` would come up empty after a switch.
+  aiq shares them back (a junction on Windows, a symlink elsewhere):
 
-  A lane sets CLAUDE_CONFIG_DIR and nothing else. .claude.json is resolved
-  inside that directory, so a lane keeps its own identity there - but the
-  `projects` half of that file is trust and per-directory settings, not account
-  state, and entering a lane copies in whatever entries it is missing. You are
-  not re-asked to trust directories you have already approved. Entries the lane
-  already has are left alone.
+    Claude   projects/  skills/  plugins/
+    Codex    sessions/  skills/  plugins/   + $CODEX_SQLITE_HOME
+
+  Codex keeps its newer conversation history in SQLite rather than in the config
+  dir, so lanes point CODEX_SQLITE_HOME at your real ~/.codex; that is the same
+  store your global codex already uses, and `codex resume` then lists the same
+  threads inside a lane as outside it.
+
+  Transcripts a lane recorded on its own are moved into the shared store the
+  next time you enter it; if a session file name is taken, the lane's copy is
+  kept alongside as <name>.lane-<lane>.jsonl. A lane's skills/ and plugins/ are
+  re-downloadable caches, so those are set aside as <name>.lane-backup instead.
+
+  A lane sets its CLI's config-dir variable and nothing else. For Claude,
+  .claude.json is resolved inside that directory, so a lane keeps its own
+  identity there - but the `projects` half of that file is trust and
+  per-directory settings, not account state, and entering a lane copies in
+  whatever entries it is missing. You are not re-asked to trust directories you
+  have already approved. Entries the lane already has are left alone.
+
+  Still per-lane on purpose: the credentials, and the CLI's own settings file
+  (settings.json / config.toml) - that is where a per-account model or
+  permission choice belongs.
 
   aiq <p> login <name>          create an account, lane, and sign in
   aiq <p> envs                  list lanes, and which one this shell uses

@@ -136,14 +136,32 @@ so a switched-to account can `--continue` / `--resume` the same conversation.
 `-c` / `--resume` on `use` (and `run`) just fold that second command into the
 switch.
 
-Lanes get there a different way. Claude Code keeps transcripts inside its config
-directory, so an isolated lane would start with an empty history and
+Lanes get there a different way. Both CLIs keep conversations, skills and
+plugins inside the config directory, so an isolated lane would start empty and
 `--continue` would find nothing. A lane isolates the *login*, not the *work*, so
-`aiq` links each lane's `projects/` to your real one — a junction on Windows (no
-admin rights needed), a symlink elsewhere. Whatever a lane recorded before this
-is moved into the shared store the first time you enter it; a session file whose
-name is already taken is kept alongside as `<name>.lane-<lane>.jsonl` rather than
-overwriting anything.
+`aiq` shares those directories back — a junction on Windows (no admin rights
+needed), a symlink elsewhere:
+
+| | shared with your real config |
+|---|---|
+| Claude | `projects/` `skills/` `plugins/` |
+| Codex | `sessions/` `skills/` `plugins/` + `$CODEX_SQLITE_HOME` |
+
+Codex keeps its newer conversation history in SQLite rather than under the
+config dir, so lanes point `CODEX_SQLITE_HOME` at your real `~/.codex`. That is
+the same store your global `codex` already writes to. Measured inside a lane,
+before and after: `threads=0 skills=9` → `threads=25 skills=39`, identical to
+what global sees.
+
+Whatever a lane recorded on its own is moved into the shared store the first
+time you enter it; a session file whose name is already taken is kept alongside
+as `<name>.lane-<lane>.jsonl` rather than overwriting anything. A lane's
+`skills/` and `plugins/` only ever hold re-downloadable caches, so those are set
+aside as `<name>.lane-backup` instead of merged.
+
+Still per-lane on purpose: the credentials, and each CLI's own settings file
+(`settings.json`, `config.toml`) — that is where a per-account model or
+permission choice belongs.
 
 A lane sets `CLAUDE_CONFIG_DIR` and nothing else. It used to set `HOME` and
 `USERPROFILE` too, which was never needed — Claude Code resolves its config as
