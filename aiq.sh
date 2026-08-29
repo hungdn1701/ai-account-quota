@@ -875,7 +875,7 @@ act_quota() {
   while IFS=$US read -r mark name alias email plan td rd q5 q7 stale hasid subd savedat; do
     [ -z "$name" ] && continue
     printf '  %s %-12.12s %-30.30s ' "${mark:- }" "$name" "$email"
-    local src="cache" out err
+    local src="cache" out err r5=""
     # An expired access token cannot read usage, and asking anyway just burns
     # requests until the API rate-limits us.
     case "$td" in
@@ -892,8 +892,11 @@ act_quota() {
         continue
       fi
       q5="$(_field "$out" q5h)"; q7="$(_field "$out" q7d)"; src="live"
+      r5="$(_field "$out" q5h_reset)"
     fi
     printf '5h '; _pct_cell "$q5"; printf '   7d '; _pct_cell "$q7"
+    # At a high percentage the only question that matters is when it clears.
+    [ -n "$r5" ] && printf '   %s5h resets %s%s' "$C_DIM" "${r5#* }" "$C_RST"
     [ "$src" = cache ] && printf '   %scached%s' "$C_DIM" "$C_RST"
     local w; w="$(_field "$out" warn)"
     [ -n "$w" ] && printf '   %s%s%s' "$C_YEL" "$w" "$C_RST"
