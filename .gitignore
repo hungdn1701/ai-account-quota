@@ -12,3 +12,6 @@ envs/
 backups/
 .aiq/
 *.bak
+
+# editor / assistant local state
+.claude/settings.local.json

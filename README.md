@@ -116,8 +116,12 @@ For Claude this calls `GET /api/oauth/usage` — the same endpoint the CLI's
 still has headroom before you switch to it. It is a read-only call and never
 refreshes a token. `AIQ_OFFLINE=1` falls back to the last saved snapshot.
 
-Codex publishes no local usage counters, so it reports plan and subscription
-window instead.
+For Codex this asks each account's own `codex app-server` for its live rate
+limits — the same numbers as Codex's own `/status`. It reads the saved
+`auth.json` without rotating it. Plans meter different windows: plus/pro report a
+5h and a weekly window, free reports a single monthly one, so each column is
+labelled by length (`5h` / `7d` / `30d`). `AIQ_OFFLINE=1` falls back to the last
+saved snapshot; set `AIQ_CODEX_BIN` if the `codex` CLI is not on `PATH`.
 
 ## Retire accounts you no longer use
 
@@ -172,17 +176,21 @@ aiq claude help       the two modes, for one provider
 | `~/.codex/profiles/<name>/` | saved Codex profiles |
 | `~/.aiq/envs/<provider>/<name>/` | parallel workspaces |
 | `~/.aiq/backups/<provider>/` | rolling backups of every overwrite |
+| `~/.aiq/cache/codex/<name>/` | scratch `CODEX_HOME` a quota read stages `auth.json` into |
 
-Nothing leaves your machine except the Claude usage request, which goes to
-`api.anthropic.com` with your own OAuth token. `aiq` never prints or transmits a
-token, and never writes one outside the directories above.
+The only things that leave your machine are the usage reads: the Claude request
+to `api.anthropic.com`, and the Codex `app-server` call to OpenAI's backend, each
+with that account's own token. `aiq` never prints or transmits a token, and never
+writes one outside the directories above.
 
 ## Environment
 
 | variable | effect |
 |---|---|
-| `AIQ_OFFLINE=1` | never call the network |
+| `AIQ_OFFLINE=1` | never call the network; use the last saved usage snapshot |
 | `AIQ_FORCE=1` | switch even while a CLI is running |
+| `AIQ_CODEX_BIN` | path to the `codex` executable when it is not on `PATH` |
+| `AIQ_CODEX_TIMEOUT` | seconds to wait for a Codex quota read (default 45) |
 | `AIQ_DIR` | where workspaces and backups live (default `~/.aiq`) |
 | `AIQ_KEEP_BACKUPS` | how many backups to keep (default 40) |
 | `NO_COLOR=1` | plain output |

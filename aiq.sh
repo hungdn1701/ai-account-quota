@@ -32,6 +32,9 @@ CODEX_PROFILES="$CODEX_HOME/profiles"
 AIQ_DIR="${AIQ_DIR:-$HOME/.aiq}"
 AIQ_BACKUPS="$AIQ_DIR/backups"
 AIQ_ENVS="$AIQ_DIR/envs"
+# Scratch CODEX_HOMEs for quota reads. Kept between runs so the model catalog
+# is fetched once per account rather than on every `aiq codex quota`.
+AIQ_CACHE="$AIQ_DIR/cache"
 AIQ_KEEP_BACKUPS="${AIQ_KEEP_BACKUPS:-40}"
 
 # ---------------------------------------------------------------- colours ---
@@ -120,6 +123,15 @@ def iso_local(s):
 def iso_days(s):
     d = iso_dt(s)
     return "%.1f" % ((d.timestamp() - time.time()) / 86400.0) if d else ""
+
+
+def epoch_iso(sec):
+    # Codex reports reset points as unix seconds; Claude as ISO. Normalise to
+    # ISO so one cache shape and one formatter serve both providers.
+    try:
+        return datetime.fromtimestamp(int(sec), timezone.utc).isoformat()
+    except Exception:
+        return ""
 
 
 def jwt_payload(tok):
@@ -261,22 +273,28 @@ def prof_read(provider, pdir):
             d["alias"] = f.read().strip()
     except Exception:
         d["alias"] = ""
-    if provider == "claude":
-        usage = jload(os.path.join(pdir, "usage.json")) or {}
-        fetched = usage.get("_fetched_at")
-        try:
-            fresh = fetched and (time.time() - float(fetched)) < float(
-                os.environ.get("AIQ_USAGE_CACHE_MAX_AGE", "21600"))
-        except Exception:
-            fresh = False
-        if fresh:
-            for key, tag in (("five_hour", "q5h"), ("seven_day", "q7d")):
-                window = usage.get(key) or {}
-                if window.get("utilization") is not None:
-                    d[tag] = str(window["utilization"])
-                if window.get("resets_at"):
-                    d[tag + "_reset"] = iso_local(window["resets_at"])
-            d["q_at"] = ms_local(float(fetched) * 1000)
+    # Both providers cache into the same usage.json shape, so one reader serves
+    # both. A stale reset time is worse than none, hence the freshness window.
+    usage = jload(os.path.join(pdir, "usage.json")) or {}
+    fetched = usage.get("_fetched_at")
+    try:
+        fresh = fetched and (time.time() - float(fetched)) < float(
+            os.environ.get("AIQ_USAGE_CACHE_MAX_AGE", "21600"))
+    except Exception:
+        fresh = False
+    if fresh:
+        for key, tag in (("five_hour", "q5h"), ("seven_day", "q7d")):
+            window = usage.get(key) or {}
+            if window.get("utilization") is not None:
+                d[tag] = str(window["utilization"])
+            if window.get("resets_at"):
+                d[tag + "_reset"] = iso_local(window["resets_at"])
+            # Codex meters whatever windows the plan has — 5h + weekly on
+            # plus/pro, one monthly window on free. Carry the length so the
+            # column can say which it is instead of assuming.
+            if window.get("window_minutes"):
+                d[tag + "_win"] = str(window["window_minutes"])
+        d["q_at"] = ms_local(float(fetched) * 1000)
     d["saved_at"] = meta.get("saved_at") or ""
     d["cred_path"] = cred
     return d
@@ -364,7 +382,8 @@ def cmd_list(argv):
             mark = "="
         row(mark, name, d.get("alias") or "-", d.get("email") or "-", d.get("plan") or "-",
             d.get("token_days"), d.get("refresh_days"), d.get("q5h"), d.get("q7d"),
-            d.get("q5h_reset"), d.get("q7d_reset"), stale, "1" if d.get("id") else "",
+            d.get("q5h_reset"), d.get("q7d_reset"), d.get("q5h_win"), d.get("q7d_win"),
+            stale, "1" if d.get("id") else "",
             d.get("sub_days"), d.get("saved_at"),
             health(provider, d))
 
@@ -511,6 +530,140 @@ def cmd_usage(argv):
     print("ok	1")
 
 
+def codex_bin():
+    """The codex executable, or "". AIQ_CODEX_BIN wins — a direct path to the
+    vendored .exe skips two shim processes."""
+    import shutil
+    b = os.environ.get("AIQ_CODEX_BIN") or ""
+    if b and os.path.exists(b):
+        return b
+    for n in ("codex.exe", "codex"):
+        p = shutil.which(n)
+        if p:
+            return p
+    return ""
+
+
+def codex_ask(exe, home, auth, timeout):
+    """Ask a codex app-server for this account's rate limits.
+
+    Codex has no usage endpoint we can GET the way Claude does — the numbers
+    ride along on the responses call and only the CLI knows how to ask. But
+    `codex app-server` speaks JSON-RPC and answers account/rateLimits/read, and
+    it reads whichever account $CODEX_HOME points at. So: stage the profile's
+    auth.json in a scratch home and ask there. The profile directory stays
+    clean, and the saved token is never handed to something that might rotate
+    it."""
+    import shutil, subprocess, threading
+    try:
+        os.makedirs(home, exist_ok=True)
+        shutil.copyfile(auth, os.path.join(home, "auth.json"))
+    except Exception as e:
+        return {"error": "cannot stage auth.json (%s)" % type(e).__name__}
+    env = dict(os.environ)
+    env["CODEX_HOME"] = home
+    argv = [exe, "app-server"]
+    # CreateProcess cannot run a .cmd shim directly, and npm installs one.
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        argv = [env.get("COMSPEC") or "cmd.exe", "/c", exe, "app-server"]
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, env=env, text=True,
+                             encoding="utf-8", bufsize=1)
+    except Exception as e:
+        return {"error": "cannot run codex (%s)" % type(e).__name__}
+    got = {}
+
+    def pump():
+        for line in p.stdout:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("id") == 2:
+                got["account"] = o.get("result") or {}
+            elif o.get("id") == 3:
+                got["limits"] = (o.get("result") or {}).get("rateLimits") or {}
+                got["rpc_error"] = o.get("error")
+                break
+    try:
+        for msg in ({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"clientInfo": {"name": "aiq", "version": "1.0.0"}}},
+                    {"jsonrpc": "2.0", "method": "initialized", "params": None},
+                    {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}},
+                    {"jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read",
+                     "params": None}):
+            p.stdin.write(json.dumps(msg) + "\n")
+            p.stdin.flush()
+    except Exception:
+        pass
+    t = threading.Thread(target=pump)
+    t.daemon = True
+    t.start()
+    t.join(timeout)
+    try:
+        p.kill()
+    except Exception:
+        pass
+    if got.get("rpc_error"):
+        return {"error": str((got["rpc_error"] or {}).get("message") or "rpc error")}
+    if "limits" not in got:
+        return {"error": "no answer from codex app-server (%.0fs)" % timeout}
+    return got
+
+
+def cmd_codex_usage(argv):
+    """home auth [cache_out] -> live quota for ONE codex profile.
+
+    primary/secondary are whatever windows the plan has: 5h + weekly on
+    plus/pro, a single 30d window on free. Report the window length so the
+    caller can label them honestly instead of assuming."""
+    home, auth = argv[0], argv[1]
+    cache = argv[2] if len(argv) > 2 else ""
+    exe = codex_bin()
+    if not exe:
+        print("error	codex CLI not found on PATH — set AIQ_CODEX_BIN")
+        return
+    got = codex_ask(exe, home, auth,
+                    float(os.environ.get("AIQ_CODEX_TIMEOUT", "45")))
+    if got.get("error"):
+        print("error	" + got["error"])
+        return
+    lim = got.get("limits") or {}
+    acct = ((got.get("account") or {}).get("account") or {})
+    body = {"_fetched_at": time.time()}
+    for src, tag, key in (("primary", "q5h", "five_hour"),
+                          ("secondary", "q7d", "seven_day")):
+        w = lim.get(src)
+        if not isinstance(w, dict):
+            continue
+        pct, at = w.get("usedPercent"), epoch_iso(w.get("resetsAt"))
+        if pct is not None:
+            print(tag + "\t" + str(pct))
+        if at:
+            print(tag + "_reset\t" + iso_local(at))
+        if w.get("windowDurationMins"):
+            print(tag + "_win\t" + str(w["windowDurationMins"]))
+        body[key] = {"utilization": pct, "resets_at": at,
+                     "window_minutes": w.get("windowDurationMins")}
+    if acct.get("email"):
+        print("email\t" + acct["email"])
+    if lim.get("planType") or acct.get("planType"):
+        print("plan\t" + str(lim.get("planType") or acct.get("planType")))
+    bal = (lim.get("credits") or {}).get("balance")
+    if bal not in (None, "", "0"):
+        print("credits\t" + str(bal))
+    if lim.get("rateLimitReachedType"):
+        print("warn\tlimit reached (%s)" % lim["rateLimitReachedType"])
+    if cache:
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump(body, f, indent=2)
+        except Exception:
+            pass
+    print("ok\t1")
+
+
 def cmd_dead(argv):
     """provider root -> names of profiles that can no longer be used"""
     provider, root = argv[0], argv[1]
@@ -521,7 +674,8 @@ def cmd_dead(argv):
 
 
 CMDS = {"dead": cmd_dead, "active": cmd_active, "list": cmd_list, "match": cmd_match, "resolve": cmd_resolve,
-        "meta": cmd_meta, "slice": cmd_slice, "merge": cmd_merge, "cmp": cmd_cmp, "usage": cmd_usage}
+        "meta": cmd_meta, "slice": cmd_slice, "merge": cmd_merge, "cmp": cmd_cmp, "usage": cmd_usage,
+        "codex_usage": cmd_codex_usage}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
@@ -737,15 +891,16 @@ _health_cell() {
 _list_one() {
   # _list_one [--archived]
   local arch="${1:-}" shown=0
-  local mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat st mcol
+  local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat st mcol
   if [ "$PROV" = claude ]; then
     printf '%s%-2s %-24s %-16s %-30s %-5s %-8s %9s %5s %5s %16s %16s%s\n' "$C_DIM" \
       "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "REFRESH" "5H" "7D" "5H RESET" "7D RESET" "$C_RST"
   else
-    printf '%s%-2s %-24s %-16s %-38s %-5s %-8s %10s%s\n' "$C_DIM" \
-      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "SUB ENDS" "$C_RST"
+    printf '%s%-2s %-24s %-16s %-34s %-5s %-8s %10s %9s %9s %16s %16s%s\n' "$C_DIM" \
+      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "SUB ENDS" "PRIMARY" "SECONDARY" \
+      "PRIMARY RESETS" "SECONDARY RESETS" "$C_RST"
   fi
-  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat st; do
+  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat st; do
     [ -z "$name" ] && continue
     shown=1
     case "$mark" in
@@ -763,8 +918,12 @@ _list_one() {
       _days_cell "$rd" 7; printf ' '
       _pct_cell "$q5"; printf ' '; _pct_cell "$q7"; printf ' '; _reset_cell "$q5r"; printf ' '; _reset_cell "$q7r"
     else
-      printf '%-24s %-16.16s %-38.38s %-5.5s ' "$name" "$alias" "$email" "$plan"
-      _health_cell "$st"; printf ' '; _days_cell "$subd" 3
+      printf '%-24s %-16.16s %-34.34s %-5.5s ' "$name" "$alias" "$email" "$plan"
+      _health_cell "$st"; printf ' '; _days_cell "$subd" 3; printf ' '
+      # Codex names its windows by length, not by role, so the cell carries the
+      # label: "5h 12%" on plus, "30d 100%" on free.
+      _win_cell "$q5" "$q5w"; printf ' '; _win_cell "$q7" "$q7w"; printf ' '
+      _reset_cell "$q5r"; printf ' '; _reset_cell "$q7r"
     fi
     [ -z "$hasid" ] && printf '  %sno identity — run: aiq %s save %s%s' "$C_DIM" "$PROV_CLI" "$name" "$C_RST"
     printf '\n'
@@ -799,6 +958,58 @@ _list_workspaces() {
 _reset_cell() {
   [ -n "$1" ] && printf '%16.16s' "$1" || printf '%16s' "-"
 }
+
+_win_label() {
+  # Window length in minutes -> the name a Codex user recognises. Plans differ:
+  # plus/pro meter 5h + weekly, free meters one monthly window.
+  case "${1:-}" in
+    300)   printf '5h' ;;
+    10080) printf '7d' ;;
+    43200) printf '30d' ;;
+    "")    printf '?' ;;
+    *)     awk -v m="$1" 'BEGIN{ if (m%1440==0) printf "%dd", m/1440;
+                                 else if (m%60==0) printf "%dh", m/60;
+                                 else printf "%dm", m }' ;;
+  esac
+}
+
+_win_cell() {
+  # "<window> <pct>" in one 9-wide column, red once it is nearly spent.
+  local p="$1" w="$2" txt
+  if [ -z "$p" ]; then printf '%9s' "-"; return; fi
+  txt="$(_win_label "$w") ${p}%"
+  if awk -v p="$p" 'BEGIN{exit !(p+0 >= 80)}'; then
+    printf '%s%9s%s' "$C_RED" "$txt" "$C_RST"
+  else
+    printf '%9s' "$txt"
+  fi
+}
+
+_codex_quota_cell() {
+  # Live percentages for one saved codex profile, printed on the current row.
+  local name="$1" d home out err q5 q7 r5 r7 w5 w7 bal warn
+  d="$P_ROOT/$name"
+  home="$AIQ_CACHE/codex/$name"
+  out="$(_py codex_usage "$(_np "$home")" "$(_np "$(_cred_in "$d")")" \
+        "$(_np "$d/usage.json")" 2>/dev/null)"
+  err="$(_field "$out" error)"
+  if [ -n "$err" ]; then
+    printf '   %s%s%s' "$C_DIM" "$err" "$C_RST"; return 0
+  fi
+  q5="$(_field "$out" q5h)"; q7="$(_field "$out" q7d)"
+  r5="$(_field "$out" q5h_reset)"; r7="$(_field "$out" q7d_reset)"
+  w5="$(_field "$out" q5h_win)"; w7="$(_field "$out" q7d_win)"
+  bal="$(_field "$out" credits)"; warn="$(_field "$out" warn)"
+  [ -n "$q5" ] && { printf '   %s ' "$(_win_label "$w5")"; _pct_cell "$q5"; }
+  [ -n "$q7" ] && { printf '   %s ' "$(_win_label "$w7")"; _pct_cell "$q7"; }
+  # At a high percentage the only question that matters is when it clears.
+  [ -n "$r5" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$w5")" "${r5#* }" "$C_RST"
+  [ -n "$r7" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$w7")" "${r7#* }" "$C_RST"
+  [ -n "$bal" ] && printf '   %scredits %s%s' "$C_DIM" "$bal" "$C_RST"
+  [ -n "$warn" ] && printf '   %s%s%s' "$C_YEL" "$warn" "$C_RST"
+  return 0
+}
+
 _field() { printf '%s' "$1" | awk -F'\t' -v k="$2" '$1==k{print $2}'; }
 
 # ---------------------------------------------------------------- actions ---
@@ -813,9 +1024,11 @@ act_ls() {
   esac
   _list_one
   _list_workspaces
+  info "  * = active global CLI; workspaces below are independent"
   if [ "$PROV" = claude ]; then
-    info "  * = active global CLI; workspaces below are independent"
     info "  5H/7D here is Claude Code's own cache; for live numbers: aiq claude quota"
+  else
+    info "  PRIMARY/SECONDARY is the last aiq codex quota; for live numbers run it again"
   fi
   local nd; nd="$(_py dead "$PROV" "$(_np "$P_ROOT")" 2>/dev/null | wc -l | tr -d ' ')"
   [ "${nd:-0}" -gt 0 ] && info "  $nd unusable profile(s) — review with: aiq $PROV_CLI prune"
@@ -1047,19 +1260,32 @@ act_quota() {
   printf '%s%s%s
 ' "$C_B" "$P_LABEL" "$C_RST"
   if [ "$PROV" != claude ]; then
-    local mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat
-    while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat; do
+    local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat
+    while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat; do
       [ -z "$name" ] && continue
       printf '  %s %-12.12s %-38.38s %-5s ' "${mark:- }" "$name" "$email" "$plan"
-      _days_cell "$subd" 3; printf '
-'
+      _days_cell "$subd" 3
+      if [ "${AIQ_OFFLINE:-}" = 1 ]; then
+        [ -n "$q5" ] && { printf '   %s ' "$(_win_label "$q5w")"; _pct_cell "$q5"; }
+        [ -n "$q7" ] && { printf '   %s ' "$(_win_label "$q7w")"; _pct_cell "$q7"; }
+        [ -n "$q5r" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$q5w")" "${q5r#* }" "$C_RST"
+        [ -n "$q7r" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$q7w")" "${q7r#* }" "$C_RST"
+        [ -n "$q5$q7" ] && printf '   %scached%s' "$C_DIM" "$C_RST"
+      else
+        _codex_quota_cell "$name"
+      fi
+      printf '\n'
     done < <(_py list codex "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null)
-    info "  Codex publishes no usage counters locally — plan and subscription window only."
+    if [ "${AIQ_OFFLINE:-}" = 1 ]; then
+      info "  offline: last saved snapshot only. Unset AIQ_OFFLINE for live numbers."
+    else
+      info "  live from each account's own codex app-server — the same numbers as /status."
+    fi
     return 0
   fi
 
   # Claude: ask Anthropic for each saved account, not just the signed-in one.
-  local mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat
+  local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat
   # The signed-in account may not be saved anywhere yet — show it first, and say so.
   if [ -f "$P_ACTIVE" ] && [ -z "$(_match)" ]; then
     local aout aerr a5 a7 r5 r7
@@ -1083,7 +1309,7 @@ act_quota() {
       fi
     fi
   fi
-  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat; do
+  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat; do
     [ -z "$name" ] && continue
     printf '  %s %-12.12s %-30.30s ' "${mark:- }" "$name" "$email"
     local src="cache" out="" err r5="" r7=""
@@ -1494,8 +1720,15 @@ QUOTA AND STATUS
   updates when you open /usage. Anything older than 6 hours is left blank rather
   than shown as a stale number. Use `aiq claude quota` for live figures.
 
-  Codex publishes no usage counters locally, so it reports the plan and the
-  subscription window instead.
+  For Codex this asks each account's own `codex app-server` for its live rate
+  limits - the same numbers as Codex's own /status. It reads the saved auth.json
+  and never rotates it. Plans meter different windows: plus/pro report a 5h and a
+  weekly window, free reports a single monthly one, so each column is labelled by
+  length (5h / 7d / 30d) rather than by role. AIQ_OFFLINE=1 uses the last saved
+  snapshot; set AIQ_CODEX_BIN if the codex CLI is not on PATH.
+
+  The PRIMARY/SECONDARY columns in `ls` are whatever the last `aiq codex quota`
+  saved; run it again for live figures.
 
   STATUS
     ok         usable
