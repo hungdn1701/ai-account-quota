@@ -261,6 +261,22 @@ def prof_read(provider, pdir):
             d["alias"] = f.read().strip()
     except Exception:
         d["alias"] = ""
+    if provider == "claude":
+        usage = jload(os.path.join(pdir, "usage.json")) or {}
+        fetched = usage.get("_fetched_at")
+        try:
+            fresh = fetched and (time.time() - float(fetched)) < float(
+                os.environ.get("AIQ_USAGE_CACHE_MAX_AGE", "21600"))
+        except Exception:
+            fresh = False
+        if fresh:
+            for key, tag in (("five_hour", "q5h"), ("seven_day", "q7d")):
+                window = usage.get(key) or {}
+                if window.get("utilization") is not None:
+                    d[tag] = str(window["utilization"])
+                if window.get("resets_at"):
+                    d[tag + "_reset"] = iso_local(window["resets_at"])
+            d["q_at"] = ms_local(float(fetched) * 1000)
     d["saved_at"] = meta.get("saved_at") or ""
     d["cred_path"] = cred
     return d
@@ -348,7 +364,8 @@ def cmd_list(argv):
             mark = "="
         row(mark, name, d.get("alias") or "-", d.get("email") or "-", d.get("plan") or "-",
             d.get("token_days"), d.get("refresh_days"), d.get("q5h"), d.get("q7d"),
-            stale, "1" if d.get("id") else "", d.get("sub_days"), d.get("saved_at"),
+            d.get("q5h_reset"), d.get("q7d_reset"), stale, "1" if d.get("id") else "",
+            d.get("sub_days"), d.get("saved_at"),
             health(provider, d))
 
 
@@ -482,9 +499,11 @@ def cmd_usage(argv):
     for key, tag in (("five_hour", "q5h"), ("seven_day", "q7d"),
                      ("seven_day_opus", "qopus"), ("seven_day_sonnet", "qsonnet")):
         w = body.get(key)
-        if isinstance(w, dict) and w.get("utilization") is not None:
-            print(tag + "	" + str(w["utilization"]))
-            print(tag + "_reset	" + iso_local(w.get("resets_at")))
+        if isinstance(w, dict):
+            if w.get("utilization") is not None:
+                print(tag + "\t" + str(w["utilization"]))
+            if w.get("resets_at"):
+                print(tag + "_reset\t" + iso_local(w.get("resets_at")))
     for lim in body.get("limits") or []:
         if lim.get("severity") not in (None, "normal"):
             print("warn	%s at %s%% (%s)" % (lim.get("kind"), lim.get("percent"),
@@ -718,15 +737,15 @@ _health_cell() {
 _list_one() {
   # _list_one [--archived]
   local arch="${1:-}" shown=0
-  local mark name alias email plan td rd q5 q7 stale hasid subd savedat st mcol
+  local mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat st mcol
   if [ "$PROV" = claude ]; then
-    printf '%s%-2s %-12s %-12s %-30s %-5s %-8s %9s %5s %5s%s\n' "$C_DIM" \
-      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "REFRESH" "5H" "7D" "$C_RST"
+    printf '%s%-2s %-24s %-16s %-30s %-5s %-8s %9s %5s %5s %16s %16s%s\n' "$C_DIM" \
+      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "REFRESH" "5H" "7D" "5H RESET" "7D RESET" "$C_RST"
   else
-    printf '%s%-2s %-12s %-12s %-38s %-5s %-8s %10s%s\n' "$C_DIM" \
+    printf '%s%-2s %-24s %-16s %-38s %-5s %-8s %10s%s\n' "$C_DIM" \
       "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "SUB ENDS" "$C_RST"
   fi
-  while IFS=$US read -r mark name alias email plan td rd q5 q7 stale hasid subd savedat st; do
+  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat st; do
     [ -z "$name" ] && continue
     shown=1
     case "$mark" in
@@ -737,14 +756,14 @@ _list_one() {
     esac
     printf '%s' "$mcol"
     if [ "$PROV" = claude ]; then
-      printf '%-12.12s %-12.12s %-30.30s %-5.5s ' "$name" "$alias" "$email" "$plan"
+      printf '%-24s %-16.16s %-30.30s %-5.5s ' "$name" "$alias" "$email" "$plan"
       _health_cell "$st"; printf ' '
       # The refresh token is the real lifetime. The access token above it is
       # short-lived by design and the CLI renews it on every run.
       _days_cell "$rd" 7; printf ' '
-      _pct_cell "$q5"; printf ' '; _pct_cell "$q7"
+      _pct_cell "$q5"; printf ' '; _pct_cell "$q7"; printf ' '; _reset_cell "$q5r"; printf ' '; _reset_cell "$q7r"
     else
-      printf '%-12.12s %-12.12s %-38.38s %-5.5s ' "$name" "$alias" "$email" "$plan"
+      printf '%-24s %-16.16s %-38.38s %-5.5s ' "$name" "$alias" "$email" "$plan"
       _health_cell "$st"; printf ' '; _days_cell "$subd" 3
     fi
     [ -z "$hasid" ] && printf '  %sno identity — run: aiq %s save %s%s' "$C_DIM" "$PROV_CLI" "$name" "$C_RST"
@@ -757,6 +776,29 @@ _list_one() {
   return 0
 }
 
+_list_workspaces() {
+  local d name out email plan here shown=0
+  for d in "$P_ENVROOT"/*/; do
+    [ -d "$d" ] || continue
+    _env_paths "${d%/}"
+    [ -f "$EV_CRED" ] || continue
+    [ "$shown" = 0 ] && {
+      printf '\n%sParallel workspaces%s\n' "$C_B" "$C_RST"
+      printf '%s  %-24s %-32s %-6s %s%s\n' "$C_DIM" "NAME" "ACCOUNT" "PLAN" "STATE" "$C_RST"
+      shown=1
+    }
+    name="$(basename "${d%/}")"
+    out="$(_py active "$PROV" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null)"
+    email="$(_field "$out" email)"; plan="$(_field "$out" plan)"
+    here=""
+    [ "$name" = "$(_env_current_name)" ] && here="  <- this shell"
+    printf '  %-24s %-32.32s %-6.6s signed in%s\n' "$name" "${email:--}" "${plan:--}" "$here"
+  done
+  [ "$shown" = 1 ] && info "  run one with: aiq $PROV_CLI run <name>"
+}
+_reset_cell() {
+  [ -n "$1" ] && printf '%16.16s' "$1" || printf '%16s' "-"
+}
 _field() { printf '%s' "$1" | awk -F'\t' -v k="$2" '$1==k{print $2}'; }
 
 # ---------------------------------------------------------------- actions ---
@@ -770,7 +812,11 @@ act_ls() {
                 _list_one --archived; return 0 ;;
   esac
   _list_one
-  [ "$PROV" = claude ] && info "  5H/7D here is Claude Code's own cache; for live numbers: aiq claude quota"
+  _list_workspaces
+  if [ "$PROV" = claude ]; then
+    info "  * = active global CLI; workspaces below are independent"
+    info "  5H/7D here is Claude Code's own cache; for live numbers: aiq claude quota"
+  fi
   local nd; nd="$(_py dead "$PROV" "$(_np "$P_ROOT")" 2>/dev/null | wc -l | tr -d ' ')"
   [ "${nd:-0}" -gt 0 ] && info "  $nd unusable profile(s) — review with: aiq $PROV_CLI prune"
   return 0
@@ -1001,8 +1047,8 @@ act_quota() {
   printf '%s%s%s
 ' "$C_B" "$P_LABEL" "$C_RST"
   if [ "$PROV" != claude ]; then
-    local mark name alias email plan td rd q5 q7 stale hasid subd savedat
-    while IFS=$US read -r mark name alias email plan td rd q5 q7 stale hasid subd savedat; do
+    local mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat
+    while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat; do
       [ -z "$name" ] && continue
       printf '  %s %-12.12s %-38.38s %-5s ' "${mark:- }" "$name" "$email" "$plan"
       _days_cell "$subd" 3; printf '
@@ -1013,10 +1059,10 @@ act_quota() {
   fi
 
   # Claude: ask Anthropic for each saved account, not just the signed-in one.
-  local mark name alias email plan td rd q5 q7 stale hasid subd savedat
+  local mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat
   # The signed-in account may not be saved anywhere yet — show it first, and say so.
   if [ -f "$P_ACTIVE" ] && [ -z "$(_match)" ]; then
-    local aout aerr a5 a7
+    local aout aerr a5 a7 r5 r7
     printf '  %s %-12.12s %-30.30s ' "!" "<signed in>"       "$(_field "$(_py active claude "${P_ARGS[@]}" 2>/dev/null)" email)"
     if [ "${AIQ_OFFLINE:-}" = 1 ]; then
       printf '%soffline%s
@@ -1028,16 +1074,19 @@ act_quota() {
 ' "$C_DIM" "$aerr" "$C_RST"
       else
         a5="$(_field "$aout" q5h)"; a7="$(_field "$aout" q7d)"
+        r5="$(_field "$aout" q5h_reset)"; r7="$(_field "$aout" q7d_reset)"
         printf '5h '; _pct_cell "$a5"; printf '   7d '; _pct_cell "$a7"
+        [ -n "$r5" ] && printf '   5h reset %s' "$r5"
+        [ -n "$r7" ] && printf '   7d reset %s' "$r7"
         printf '   %sNOT SAVED — run: aiq claude save <name>%s
 ' "$C_YEL" "$C_RST"
       fi
     fi
   fi
-  while IFS=$US read -r mark name alias email plan td rd q5 q7 stale hasid subd savedat; do
+  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r stale hasid subd savedat; do
     [ -z "$name" ] && continue
     printf '  %s %-12.12s %-30.30s ' "${mark:- }" "$name" "$email"
-    local src="cache" out="" err r5=""
+    local src="cache" out="" err r5="" r7=""
     # An expired access token cannot read usage, and asking anyway just burns
     # requests until the API rate-limits us.
     case "$td" in
@@ -1054,11 +1103,12 @@ act_quota() {
         continue
       fi
       q5="$(_field "$out" q5h)"; q7="$(_field "$out" q7d)"; src="live"
-      r5="$(_field "$out" q5h_reset)"
+      r5="$(_field "$out" q5h_reset)"; r7="$(_field "$out" q7d_reset)"
     fi
     printf '5h '; _pct_cell "$q5"; printf '   7d '; _pct_cell "$q7"
     # At a high percentage the only question that matters is when it clears.
-    [ -n "$r5" ] && printf '   %s5h resets %s%s' "$C_DIM" "${r5#* }" "$C_RST"
+    [ -n "$r5" ] && printf '   %s5h reset %s%s' "$C_DIM" "${r5#* }" "$C_RST"
+    [ -n "$r7" ] && printf '   %s7d reset %s%s' "$C_DIM" "${r7#* }" "$C_RST"
     [ "$src" = cache ] && printf '   %scached%s' "$C_DIM" "$C_RST"
     local w; w="$(_field "$out" warn)"
     [ -n "$w" ] && printf '   %s%s%s' "$C_YEL" "$w" "$C_RST"
