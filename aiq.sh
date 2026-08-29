@@ -287,7 +287,10 @@ def health(provider, d):
         f = float(v)
     except Exception:
         return "unknown"
-    if f < 0:
+    # <= 0, not < 0: a window that has just closed comes through as -0.0, and
+    # -0.0 < 0 is False in Python, which reported a dead account as merely
+    # "expiring" while the days column already said expired.
+    if f <= 0:
         return "dead"
     return "expiring" if f < (7 if provider == "claude" else 3) else "ok"
 

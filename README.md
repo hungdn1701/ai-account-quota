@@ -64,8 +64,13 @@ Or just run the script in place — it has no build step:
 ```
 
 **Requirements:** bash 3.2+ and Python 3.6+ (used only to parse JSON and decode
-JWTs — no packages to install). On Windows, run it in Git Bash. `jq` is *not*
-required.
+JWTs — no packages to install). `jq` is *not* required.
+
+**On Windows**, `install.sh` also drops an `aiq.cmd` launcher next to `aiq`, so
+the command works from PowerShell and `cmd.exe` as well as Git Bash. The launcher
+locates Git Bash on its own; set `AIQ_BASH` to override it. It deliberately
+ignores `bash` on `PATH`, because that is usually WSL's bash, which cannot see
+the `~/.claude` and `~/.codex` your Windows CLIs actually use.
 
 ## Run two accounts at once
 

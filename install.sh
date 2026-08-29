@@ -30,5 +30,17 @@ if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; 
   echo "warning: no python3/python found — aiq needs one to read JSON." >&2
 fi
 
+# On Windows, also install the launcher that lets cmd.exe and PowerShell run it.
+# Without this they only see an extension-less file and offer an "open with" dialog.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    SHIM="$(dirname "$SRC")/aiq.cmd"
+    if [ -f "$SHIM" ]; then
+      cp -f "$SHIM" "$BIN/aiq.cmd"
+      echo "installed: $BIN/aiq.cmd  (so PowerShell and cmd can run it)"
+    fi
+    ;;
+esac
+
 echo
 echo "Try:  aiq doctor"
