@@ -434,8 +434,11 @@ def cmd_usage(argv):
             body = json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         code = e.code
-        print("error	" + ("access token expired - switch to it and run the CLI once"
-                           if code in (401, 403) else "HTTP %d" % code))
+        msg = {401: "access token expired - switch to it and run the CLI once",
+               403: "access token expired - switch to it and run the CLI once",
+               429: "rate limited by the API - try again shortly"}.get(
+                   code, "HTTP %d" % code)
+        print("error	" + msg)
         return
     except Exception as e:
         print("error	" + type(e).__name__)
@@ -494,13 +497,18 @@ _set_provider() {
       PROV=claude; P_ACTIVE="$CLAUDE_CRED"; P_SESSION="$CLAUDE_SESSION"
       P_ROOT="$CLAUDE_PROFILES"; P_CREDNAME=".credentials.json"; P_LABEL="Claude Code"
       P_ENVVAR="CLAUDE_CONFIG_DIR"; P_CLI="claude" ;;
-    gpt|codex|cx|chatgpt|openai)
-      PROV=gpt; P_ACTIVE="$CODEX_AUTH"; P_SESSION=""
+    codex|cx|gpt|chatgpt|openai)
+      PROV=codex; P_ACTIVE="$CODEX_AUTH"; P_SESSION=""
       P_ROOT="$CODEX_PROFILES"; P_CREDNAME="auth.json"; P_LABEL="Codex CLI"
       P_ENVVAR="CODEX_HOME"; P_CLI="codex" ;;
     *) return 1 ;;
   esac
   P_ENVROOT="$AIQ_ENVS/$PROV"
+  # "gpt" was the internal name before 1.1; move anything left under it.
+  if [ "$PROV" = codex ]; then
+    [ -d "$AIQ_ENVS/gpt" ] && [ ! -e "$P_ENVROOT" ] && mv "$AIQ_ENVS/gpt" "$P_ENVROOT" 2>/dev/null
+    [ -d "$AIQ_BACKUPS/gpt" ] && [ ! -e "$AIQ_BACKUPS/codex" ] && mv "$AIQ_BACKUPS/gpt" "$AIQ_BACKUPS/codex" 2>/dev/null
+  fi
   mkdir -p "$P_ROOT" "$AIQ_DIR" 2>/dev/null
   if [ "$PROV" = claude ]; then P_ARGS=("$(_np "$P_ACTIVE")" "$(_np "$P_SESSION")")
   else P_ARGS=("$(_np "$P_ACTIVE")"); fi
@@ -546,9 +554,9 @@ _store() {
     _py slice "$(_np "$P_SESSION")" "$(_np "$d/claude.json")" || return 1
     _py meta claude "$(_np "$d/$P_CREDNAME")" "$(_np "$d/claude.json")" "$(_np "$d/profile.json")" >/dev/null || return 1
   else
-    _py meta gpt "$(_np "$d/$P_CREDNAME")" "$(_np "$d/profile.json")" >/dev/null || return 1
+    _py meta codex "$(_np "$d/$P_CREDNAME")" "$(_np "$d/profile.json")" >/dev/null || return 1
     # keep profile.email so the older shell scripts still read correctly
-    _py active gpt "$(_np "$d/$P_CREDNAME")" 2>/dev/null \
+    _py active codex "$(_np "$d/$P_CREDNAME")" 2>/dev/null \
       | awk -F'\t' '$1=="email" && $2!="" {print $2}' > "$d/profile.email"
     [ -s "$d/profile.email" ] || rm -f "$d/profile.email"
   fi
@@ -837,7 +845,7 @@ act_quota() {
       printf '  %s %-12.12s %-38.38s %-5s ' "${mark:- }" "$name" "$email" "$plan"
       _days_cell "$subd" 3; printf '
 '
-    done < <(_py list gpt "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null)
+    done < <(_py list codex "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null)
     info "  Codex publishes no usage counters locally — plan and subscription window only."
     return 0
   fi
@@ -868,6 +876,13 @@ act_quota() {
     [ -z "$name" ] && continue
     printf '  %s %-12.12s %-30.30s ' "${mark:- }" "$name" "$email"
     local src="cache" out err
+    # An expired access token cannot read usage, and asking anyway just burns
+    # requests until the API rate-limits us.
+    case "$td" in
+      ""|-*)
+        printf '%saccess token expired - aiq claude use %s, then run claude once%s\n' "$C_DIM" "$name" "$C_RST"
+        continue ;;
+    esac
     if [ "${AIQ_OFFLINE:-}" != 1 ]; then
       out="$(_py usage "$(_np "$(_cred_in "$P_ROOT/$name")")" "$(_np "$P_ROOT/$name/usage.json")" 2>/dev/null)"
       err="$(_field "$out" error)"
@@ -1051,7 +1066,7 @@ act_doctor() {
   printf '  %-12s%s\n' "helpers" "${extra:-  none}"
   printf '\n'
   local p
-  for p in claude gpt; do
+  for p in claude codex; do
     _set_provider "$p"
     printf '  %s%s%s\n' "$C_B" "$P_LABEL" "$C_RST"
     if [ -f "$P_ACTIVE" ]; then printf '    %-10s %s\n' "auth" "$P_ACTIVE"
@@ -1075,7 +1090,7 @@ act_doctor() {
 AIQ_LS_FLAG=""
 act_both() {
   local what="$1" p
-  for p in claude gpt; do
+  for p in claude codex; do
     _set_provider "$p"; PROV_CLI="$p"
     case "$what" in
       ls)     act_ls "$AIQ_LS_FLAG" ;;
@@ -1094,7 +1109,7 @@ aiq — switch Claude Code / Codex CLI accounts, and read their quota
   aiq doctor                        environment check
   aiq <provider> <action> [args]
 
-providers   claude (cl)    gpt (codex, cx)
+providers   claude (cl)    codex (cx)
 
 actions
   ls                      list profiles: account, plan, token life, quota
@@ -1129,7 +1144,7 @@ run two accounts at once (no switching involved)
 
 examples
   aiq claude save a1 personal
-  aiq gpt use work
+  aiq codex use work
   aiq ls
 
 Before anything that overwrites an auth file, aiq writes the live token back into
@@ -1150,7 +1165,7 @@ main() {
     active|status|who) act_both active; return 0 ;;
   esac
 
-  _set_provider "$1" || die "unknown provider '$1' — expected claude or gpt (see: aiq --help)"
+  _set_provider "$1" || die "unknown provider '$1' — expected claude or codex (see: aiq --help)"
   PROV_CLI="$1"; shift
   local action="${1:-ls}"; [ $# -gt 0 ] && shift
   case "$action" in

@@ -161,7 +161,7 @@ one on the next run.
 ```
 aiq ls | quota | active            both providers
 aiq doctor                         environment check
-aiq <provider> <action> [args]     provider: claude (cl) · gpt (codex, cx)
+aiq <provider> <action> [args]     provider: claude (cl) · codex (cx)
 
 profiles     ls [--all|--archived] · use · save · active · quota · rm
              archive · restore · prune [--yes] · sync
