@@ -927,13 +927,6 @@ act_use() {
   [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias>"
   name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
   [ -z "$name" ] && die "no profile or alias called '$key' — see: aiq $PROV_CLI ls"
-  if [ -z "$workspace" ] && [ -n "$name" ]; then
-    local candidate="$name" resolved
-    resolved="$(_py resolve "$(_np "$P_ROOT")" "$name" 2>/dev/null | head -n1)"
-    [ -n "$resolved" ] && { candidate="$resolved"; name="$resolved"; }
-    _env_paths "$(_env_dir "$candidate")"
-    [ -f "$EV_CRED" ] && workspace="$candidate"
-  fi
   d="$P_ROOT/$name"
   if _running; then
     warn "a $P_LABEL process is running. It keeps its token in memory and will"
@@ -1044,7 +1037,7 @@ act_quota() {
   while IFS=$US read -r mark name alias email plan td rd q5 q7 stale hasid subd savedat; do
     [ -z "$name" ] && continue
     printf '  %s %-12.12s %-30.30s ' "${mark:- }" "$name" "$email"
-    local src="cache" out err r5=""
+    local src="cache" out="" err r5=""
     # An expired access token cannot read usage, and asking anyway just burns
     # requests until the API rate-limits us.
     case "$td" in
