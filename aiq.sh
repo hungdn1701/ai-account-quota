@@ -1695,6 +1695,12 @@ act_doctor() {
     fi
   done
   printf '    %-10s %s\n' "backups" "$AIQ_BACKUPS"
+  # Scratch CODEX_HOMEs for quota reads. Safe to delete at any time; the next
+  # `aiq codex quota` rebuilds them. Sized here because they are not small.
+  if [ -d "$AIQ_CACHE" ]; then
+    local sz; sz="$(du -sh "$AIQ_CACHE" 2>/dev/null | cut -f1)"
+    printf '    %-10s %s  (%s, safe to delete)\n' "cache" "$AIQ_CACHE" "${sz:-?}"
+  fi
 }
 
 AIQ_LS_FLAG=""
