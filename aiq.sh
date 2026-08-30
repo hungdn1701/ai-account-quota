@@ -6,7 +6,8 @@
 # and gets your device de-authorised. See README, "The re-login trap".
 set -uo pipefail
 
-AIQ_VERSION="1.0.0"
+AIQ_VERSION="1.1.0"
+AIQ_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 US=$''   # field separator between the python engine and this script
 
 # ------------------------------------------------------------------ paths ---
@@ -96,7 +97,7 @@ _np() {
 }
 
 read -r -d '' AIQ_PY <<'PYCODE'
-import sys, json, base64, os, time, hashlib
+import sys, json, base64, os, time, hashlib, re
 from datetime import datetime, timezone
 
 # Windows Python emits CRLF; the shell reading these rows splits on LF and
@@ -192,13 +193,17 @@ def row(*cells):
 def claude_read(cred, session):
     d = {}
     o = (jload(cred) or {}).get("claudeAiOauth") or {}
+    access = o.get("accessToken") or ""
+    refresh = o.get("refreshToken") or ""
     d["token_at"] = ms_local(o.get("expiresAt"))
     d["token_days"] = ms_days(o.get("expiresAt"))
     d["token_ms"] = str(o.get("expiresAt") or "")
     d["refresh_at"] = ms_local(o.get("refreshTokenExpiresAt"))
     d["refresh_days"] = ms_days(o.get("refreshTokenExpiresAt"))
     d["plan"] = o.get("subscriptionType") or ""
-    d["has_cred"] = "1" if o else "0"
+    # Claude leaves an OAuth object behind after logout; only non-empty token
+    # strings are evidence that a saved credential is usable.
+    d["has_cred"] = "1" if (access or refresh) else "0"
 
     s = jload(session) or {}
     oa = s.get("oauthAccount") or {}
@@ -208,6 +213,12 @@ def claude_read(cred, session):
 
     cu = s.get("cachedUsageUtilization") or {}
     u = cu.get("utilization") or {}
+    cache_id = cu.get("accountUuid") or ""
+    d["usage_mismatch"] = "1" if (cache_id and d["id"] and cache_id != d["id"]) else "0"
+    if d["usage_mismatch"] == "1":
+        # A shared ~/.claude.json can contain the previous account's cache.
+        # Do not display or persist it under the current owner.
+        u = {}
     # Claude Code only refreshes this cache when its /usage screen is opened, so
     # it goes stale quickly. Reporting a stale 0% is worse than reporting nothing:
     # past the cutoff we show blank and let `aiq quota` fetch the live figure.
@@ -224,7 +235,7 @@ def claude_read(cred, session):
         # The reset time is as stale as the percentage it belongs to. Showing it
         # after blanking the number invites reading a spent window as current.
         d[tag + "_reset"] = "" if not fresh else iso_local(b.get("resets_at"))
-    d["q_at"] = ms_local(cu.get("fetchedAtMs"))
+    d["q_at"] = "" if d["usage_mismatch"] == "1" else ms_local(cu.get("fetchedAtMs"))
     d["sub_at"] = ""
     d["sub_days"] = ""
     return d
@@ -232,7 +243,190 @@ def claude_read(cred, session):
 
 def claude_slice(session):
     s = jload(session) or {}
-    return {k: s[k] for k in ACCOUNT_KEYS if k in s}
+    result = {k: s[k] for k in ACCOUNT_KEYS if k in s}
+    oa = s.get("oauthAccount") or {}
+    cu = result.get("cachedUsageUtilization") or {}
+    if (cu.get("accountUuid") and oa.get("accountUuid") and
+            cu.get("accountUuid") != oa.get("accountUuid")):
+        result.pop("cachedUsageUtilization", None)
+    return result
+
+
+def text_snippet(value, limit=180):
+    """Human-readable transcript text; bounded and stripped of token-shaped data."""
+    bits = []
+    if isinstance(value, str):
+        bits.append(value)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                bits.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                bits.append(str(item.get("text") or ""))
+    elif isinstance(value, dict):
+        bits.append(str(value.get("text") or ""))
+    text = " ".join(bits)
+    text = re.sub(r"(?i)(bearer\s+\S+|sk-ant-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_.-]{30,})",
+                  "<redacted>", text)
+    text = re.sub(r"[\r\n\t\x1f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def claude_project_dir(projects_root, project):
+    """Resolve a working directory to Claude's projects/<encoded-path> store."""
+    if not os.path.isdir(projects_root):
+        return ""
+    raw = os.path.abspath(project or os.getcwd())
+    if os.path.isdir(raw) and os.path.dirname(raw) == os.path.abspath(projects_root):
+        return raw
+    key = re.sub(r"[^A-Za-z0-9._-]", "-", raw.replace("\\", "/"))
+    candidate = os.path.join(projects_root, key)
+    if os.path.isdir(candidate):
+        return candidate
+    wanted = key.lower()
+    for name in os.listdir(projects_root):
+        if name.lower() == wanted and os.path.isdir(os.path.join(projects_root, name)):
+            return os.path.join(projects_root, name)
+    return ""
+
+
+def claude_session_info(path, profiles_root=""):
+    info = {"id": os.path.basename(path).rsplit(".jsonl", 1)[0], "owner": "",
+            "email": "", "profile": "", "updated": "", "branch": "",
+            "cwd": "", "state": "open", "request": "", "reply": "", "path": path}
+    last_ts = 0.0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+            for raw in stream:
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("sessionId"):
+                    info["id"] = str(obj["sessionId"])
+                if obj.get("ownerAccountUuid") and not info["owner"]:
+                    info["owner"] = str(obj["ownerAccountUuid"])
+                info["cwd"] = info["cwd"] or str(obj.get("cwd") or "")
+                info["branch"] = info["branch"] or str(obj.get("gitBranch") or "")
+                stamp = obj.get("timestamp") or ""
+                try:
+                    parsed = iso_dt(stamp).timestamp() if stamp else 0.0
+                except Exception:
+                    parsed = 0.0
+                if parsed >= last_ts:
+                    last_ts = parsed
+                    info["updated"] = iso_local(stamp)
+                message = obj.get("message") or {}
+                role = message.get("role") if isinstance(message, dict) else ""
+                content = message.get("content") if isinstance(message, dict) else ""
+                origin = obj.get("origin") or {}
+                human = (obj.get("promptSource") == "typed" or origin.get("kind") == "human" or
+                         (obj.get("type") == "user" and isinstance(content, str)))
+                if role == "user" and human:
+                    snippet = text_snippet(content)
+                    if snippet:
+                        info["request"] = snippet
+                if role == "assistant":
+                    snippet = text_snippet(content)
+                    if snippet:
+                        info["reply"] = snippet
+                cause = str(obj.get("cause") or "")
+                if (obj.get("type") == "history-suppression" and "owner_mismatch" in cause) or \
+                        "authentication_failed" in raw:
+                    info["state"] = "auth-error"
+    except Exception:
+        info["state"] = "unreadable"
+    try:
+        info["mtime"] = os.path.getmtime(path)
+    except Exception:
+        info["mtime"] = 0.0
+    if info["owner"] and profiles_root:
+        for name in profiles_of(profiles_root):
+            profile = prof_read("claude", os.path.join(profiles_root, name))
+            if profile.get("id") == info["owner"]:
+                info["profile"] = name
+                info["email"] = profile.get("email") or ""
+                break
+    return info
+
+
+def claude_sessions(projects_root, project, profiles_root=""):
+    directory = claude_project_dir(projects_root, project)
+    if not directory:
+        return "", []
+    rows = []
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if name.lower().endswith(".jsonl") and os.path.isfile(path):
+            rows.append(claude_session_info(path, profiles_root))
+    rows.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+    return directory, rows
+
+
+def cmd_sessions(argv):
+    """projects_root project profiles_root [limit] -> project-local Claude sessions."""
+    projects_root, project, profiles_root = argv[0], argv[1], argv[2]
+    try:
+        limit = max(1, min(200, int(argv[3]))) if len(argv) > 3 else 30
+    except Exception:
+        limit = 30
+    directory, sessions = claude_sessions(projects_root, project, profiles_root)
+    if not directory:
+        print("error\tno Claude transcript directory for " + project)
+        return
+    for item in sessions[:limit]:
+        row(item["id"], item["owner"], item["email"], item["profile"], item["updated"],
+            item["state"], item["branch"], item["request"], item["path"])
+
+
+def handoff_markdown(item, project_dir):
+    owner = item.get("email") or ("account UUID " + item.get("owner", "unknown"))
+    return "\n".join([
+        "# Claude session handoff", "",
+        "This is a handoff into a **new Claude session**. Do not run `--resume` on the source session:",
+        "Claude binds that session to its original account owner.", "",
+        "- Source session: `" + item.get("id", "") + "`",
+        "- Source owner: `" + owner + "`" + (" (" + item.get("owner") + ")" if item.get("owner") else "") + "`",
+        "- Project transcript directory: `" + project_dir + "`",
+        "- Last activity: `" + (item.get("updated") or "unknown") + "`",
+        "- Branch: `" + (item.get("branch") or "unknown") + "`", "",
+        "## Required next steps", "",
+        "1. Read the source transcript at `" + item.get("path", "") + "` and extract the unfinished task, decisions, files changed, errors, and next action.",
+        "2. Inspect the current worktree (`git status`, diff, relevant files and tests); the transcript is context, not ground truth.",
+        "3. Verify the current state and continue the unfinished work under this account.",
+        "4. Before another account switch, write a fresh checkpoint into this handoff file or a project checkpoint file.", "",
+        "## Last human request (hint)", item.get("request") or "(not available)", "",
+        "## Last assistant update (hint)", item.get("reply") or "(not available)", "",
+        "Source transcript is read-only for this handoff: `" + item.get("path", "") + "`", ""
+    ])
+
+
+def cmd_handoff(argv):
+    """projects_root project profiles_root selector output -> write handoff."""
+    projects_root, project, profiles_root, selector, output = argv[:5]
+    directory, sessions = claude_sessions(projects_root, project, profiles_root)
+    selected = None
+    if selector in ("", "latest", "last"):
+        selected = sessions[0] if sessions else None
+    else:
+        selected = next((item for item in sessions if item["id"] == selector), None)
+    if not selected:
+        print("error\tno Claude session found: " + selector)
+        return
+    content = handoff_markdown(selected, directory)
+    content = content.replace(chr(96) + chr(32) + chr(40), chr(32) + chr(40))
+    if output:
+        parent = os.path.dirname(output)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(output, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+        print("written\t" + output)
+    else:
+        print(content, end="")
 
 
 # ----------------------------------------------------------------- codex ---
@@ -347,6 +541,8 @@ def health(provider, d):
         # Subscription metadata is not an authentication verdict. Free users
         # can have an expired subscription timestamp and still use Codex.
         return "ok" if d.get("has_cred") == "1" else "dead"
+    if d.get("has_cred") != "1":
+        return "dead"
     v = d.get("refresh_days")
     if v in (None, ""):
         return "unknown"
@@ -506,6 +702,134 @@ def cmd_merge(argv):
     live.update(sl)
     with open(argv[1], "w", encoding="utf-8") as f:
         json.dump(live, f, indent=2)
+
+
+def _positive_seconds(value):
+    try:
+        value = float(value)
+        return value if value > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _atomic_json(path, value):
+    """Replace a credential JSON atomically, without printing its contents."""
+    import tempfile, stat
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".aiq-refresh-", suffix=".json", dir=parent,
+                               text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def cmd_refresh(argv):
+    """Refresh one Claude credential using Claude Code's OAuth consumer flow."""
+    import urllib.request, urllib.error
+    if not argv:
+        print("error\tcredential path is required")
+        return 1
+    cred = argv[0]
+    document = jload(cred)
+    if not isinstance(document, dict):
+        print("error\tcredential file is not a JSON object")
+        return 1
+    oauth = document.get("claudeAiOauth") or {}
+    if not isinstance(oauth, dict):
+        print("error\tcredential file has invalid claudeAiOauth data")
+        return 1
+    refresh = oauth.get("refreshToken") or ""
+    if not isinstance(refresh, str) or not refresh:
+        print("error\tno refresh token in " + os.path.basename(cred))
+        return 1
+
+    now_ms = int(time.time() * 1000)
+    try:
+        refresh_at = int(oauth.get("refreshTokenExpiresAt") or 0)
+    except Exception:
+        refresh_at = 0
+    if refresh_at and refresh_at <= now_ms:
+        print("error\trefresh token expired; run 'claude' and /login again")
+        return 1
+
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        "scope": " ".join(("user:profile", "user:inference", "user:sessions:claude_code",
+                            "user:mcp_servers", "user:file_upload")),
+    }
+    request = urllib.request.Request(
+        "https://platform.claude.com/v1/oauth/token",
+        data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": "aiq"})
+    try:
+        with urllib.request.urlopen(request,
+                                    timeout=float(os.environ.get("AIQ_TIMEOUT", "30"))) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 403):
+            message = "refresh rejected (token expired or revoked); run 'claude' and /login again"
+        elif exc.code == 429:
+            message = "refresh rate limited by Anthropic; try again shortly"
+        else:
+            message = "refresh failed (HTTP %d)" % exc.code
+        print("error\t" + message)
+        return 1
+    except Exception as exc:
+        print("error\trefresh failed (" + type(exc).__name__ + ")")
+        return 1
+
+    if not isinstance(body, dict):
+        print("error\trefresh returned an invalid response")
+        return 1
+    access = body.get("access_token") or ""
+    access_seconds = _positive_seconds(body.get("expires_in"))
+    if not isinstance(access, str) or not access or not access_seconds:
+        print("error\trefresh response did not contain a usable access token")
+        return 1
+    rotated = body.get("refresh_token")
+    if not isinstance(rotated, str) or not rotated:
+        rotated = refresh
+
+    updated = dict(document)
+    updated_oauth = dict(oauth)
+    updated_oauth["accessToken"] = access
+    updated_oauth["refreshToken"] = rotated
+    updated_oauth["expiresAt"] = now_ms + int(access_seconds * 1000)
+    refresh_seconds = _positive_seconds(body.get("refresh_token_expires_in"))
+    if refresh_seconds:
+        updated_oauth["refreshTokenExpiresAt"] = now_ms + int(refresh_seconds * 1000)
+    scope = body.get("scope")
+    if isinstance(scope, str) and scope.strip():
+        updated_oauth["scopes"] = scope.split()
+    elif isinstance(scope, list) and scope:
+        updated_oauth["scopes"] = scope
+    updated["claudeAiOauth"] = updated_oauth
+    try:
+        _atomic_json(cred, updated)
+    except Exception as exc:
+        print("error\tcould not save refreshed credentials (" + type(exc).__name__ + ")")
+        return 1
+    print("ok\t1")
+    print("access_days\t%.1f" % (access_seconds / 86400.0))
+    if refresh_seconds:
+        print("refresh_days\t%.1f" % (refresh_seconds / 86400.0))
+    return 0
 
 
 def cmd_usage(argv):
@@ -784,19 +1108,23 @@ def cmd_dead(argv):
 
 
 CMDS = {"dead": cmd_dead, "active": cmd_active, "list": cmd_list, "match": cmd_match, "resolve": cmd_resolve,
-        "meta": cmd_meta, "slice": cmd_slice, "merge": cmd_merge, "cmp": cmd_cmp, "usage": cmd_usage,
+        "meta": cmd_meta, "slice": cmd_slice, "merge": cmd_merge, "cmp": cmd_cmp, "refresh": cmd_refresh, "usage": cmd_usage,
         "codex_usage": cmd_codex_usage, "lane_projects": cmd_lane_projects,
-        "seed_projects": cmd_seed_projects}
+        "seed_projects": cmd_seed_projects, "sessions": cmd_sessions, "handoff": cmd_handoff}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
         sys.exit(2)
-    CMDS[sys.argv[1]](sys.argv[2:])
+    result = CMDS[sys.argv[1]](sys.argv[2:])
+    if isinstance(result, int):
+        sys.exit(result)
 PYCODE
 
 _py() {
   _find_py || die "python3 (or python) is required — run: aiq doctor"
-  "$AIQ_PY_BIN" -c "$AIQ_PY" "$@"
+  # Feed the embedded engine over stdin; Windows CreateProcess has a short
+  # command-line limit that the session/handoff parser can exceed.
+  printf '%s\n' "$AIQ_PY" | "$AIQ_PY_BIN" - "$@"
 }
 
 # -------------------------------------------------------------- provider ---
@@ -933,6 +1261,49 @@ _load() {
   return 0
 }
 
+_claude_refresh_profile() {
+  [ "$PROV" = claude ] || return 1
+  local d="$1" force="${2:-}" cred before td rd out msg active_name access_days refresh_days line
+  cred="$(_cred_in "$d")"
+  [ -f "$cred" ] || { warn "profile '$(basename "$d")' has no credential file"; return 1; }
+
+  before="$(_py active claude "$(_np "$cred")" "$(_np "$d/claude.json")" 2>/dev/null)"
+  td="$(_field "$before" token_days)"; rd="$(_field "$before" refresh_days)"
+  case "$td" in
+    ""|*-*) ;;
+    *) [ "$force" = force ] || return 0 ;;
+  esac
+  case "$rd" in
+    ""|*-*)
+      warn "Claude profile '$(basename "$d")' has no usable refresh token"
+      return 1 ;;
+  esac
+
+  active_name="$(_match)"
+  _backup "$cred" "prerefresh"
+  out="$(_py refresh "$(_np "$cred")" 2>&1)" || {
+    msg="$(_field "$out" error)"
+    [ -n "$msg" ] || msg="unknown error"
+    warn "Claude refresh for '$(basename "$d")' failed: $msg"
+    return 1
+  }
+  if [ -f "$d/claude.json" ]; then
+    _py meta claude "$(_np "$cred")" "$(_np "$d/claude.json")"       "$(_np "$d/profile.json")" >/dev/null 2>&1 || true
+  else
+    _py meta claude "$(_np "$cred")" "$(_np "$d/profile.json")" >/dev/null 2>&1 || true
+  fi
+  if [ "$active_name" = "$(basename "$d")" ]; then
+    cp -f "$cred" "$P_ACTIVE" || return 1
+  fi
+  access_days="$(_field "$out" access_days)"
+  refresh_days="$(_field "$out" refresh_days)"
+  line="refreshed Claude access token for '$(basename "$d")'"
+  [ -n "$access_days" ] && line="$line (access $access_days""d)"
+  [ -n "$refresh_days" ] && line="$line; refresh $refresh_days""d"
+  info "$line"
+  return 0
+}
+
 _match() { _py match "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null | head -n1; }
 
 # --------------------------------------------------------------- autosync ---
@@ -941,9 +1312,39 @@ _match() { _py match "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null | hea
 # first, the newest refresh token is lost forever and the next restore replays a
 # spent one — which providers treat as token theft and answer by de-authorising
 # the device. So: write back before every overwrite, always.
+# Explicit refresh action; autosync below still protects rotated tokens on switches.
+
+act_refresh() {
+  [ "$PROV" = claude ] || die "refresh is only available for Claude Code"
+  local key="${1:-}" name d active_name
+  [ "$#" -le 1 ] || die "usage: aiq claude refresh [profile|alias]"
+  if [ -n "$key" ]; then
+    name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+    [ -n "$name" ] || die "no profile or alias called '$key' ? see: aiq claude ls"
+  else
+    name="$(_match)"
+    [ -n "$name" ] || die "no active Claude profile ? pass a profile name"
+  fi
+  d="$P_ROOT/$name"
+  [ -f "$(_cred_in "$d")" ] || die "profile '$name' has no credential file"
+  active_name="$(_match)"
+  if [ "$active_name" = "$name" ] && _running; then
+    die "a Claude process is running; close it before refreshing the active profile"
+  fi
+  info "refreshing Claude profile: $name"
+  _claude_refresh_profile "$d" force
+}
+
 _sync() {
   [ -f "$P_ACTIVE" ] || return 0
   local match cred
+  # Claude leaves an empty OAuth object after logout. Metadata can still name
+  # the account, but copying that empty object would destroy its saved token.
+  if [ "$PROV" = claude ]; then
+    local live_has
+    live_has="$(_field "$(_py active claude "${P_ARGS[@]}" 2>/dev/null)" has_cred)"
+    [ "$live_has" = 1 ] || return 0
+  fi
   match="$(_match)"
   [ -z "$match" ] && return 0
   cred="$(_cred_in "$P_ROOT/$match")"
@@ -1148,6 +1549,57 @@ _codex_quota_cell() {
 _field() { printf '%s' "$1" | awk -F'\t' -v k="$2" '$1==k{print $2}'; }
 
 # ---------------------------------------------------------------- actions ---
+act_sessions() {
+  [ "$PROV" = claude ] || die "session listing is only available for Claude Code"
+  local project="$PWD" limit=30
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project|-p) [ $# -ge 2 ] || die "usage: aiq claude sessions [--project <dir>] [--limit <n>]"; project="$2"; shift 2 ;;
+      --limit|-n) [ $# -ge 2 ] || die "usage: aiq claude sessions [--project <dir>] [--limit <n>]"; limit="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "aiq claude sessions: unknown option '$1'" ;;
+      *) project="$1"; shift ;;
+    esac
+  done
+  printf '%sClaude sessions%s  %s%s%s\n' "$C_B" "$C_RST" "$C_DIM" "$project" "$C_RST"
+  printf '%-2s %-38s %-28s %-12s %-16s %-11s %-12s %s\n' \
+    "@" "SESSION" "OWNER" "PROFILE" "UPDATED" "STATE" "BRANCH" "LAST REQUEST"
+  local active_id; active_id="$(_field "$(_py active claude "${P_ARGS[@]}" 2>/dev/null)" id)"
+  local sid owner email profile updated state branch request path mark owner_cell
+  while IFS=$US read -r sid owner email profile updated state branch request path; do
+    [ -n "$sid" ] || continue
+    mark=" "; [ -n "$active_id" ] && [ "$owner" = "$active_id" ] && mark="*"
+    owner_cell="${email:-${owner:+uuid:${owner:0:8}}}"
+    [ -n "$owner_cell" ] || owner_cell="unknown"
+    printf '%s  %-38.38s %-28.28s %-12.12s %-16.16s %-11.11s %-12.12s %s\n' \
+      "$mark" "$sid" "$owner_cell" "${profile:--}" "${updated:--}" "${state:--}" \
+      "${branch:--}" "${request:-(no human request found)}"
+  done < <(_py sessions "$(_np "$P_HOST/projects")" "$(_np "$project")" "$(_np "$P_ROOT")" "$limit")
+  info "  * = session owner matches the account in this shell"
+  info "  handoff: aiq claude handoff <session-id>"
+}
+
+act_handoff() {
+  [ "$PROV" = claude ] || die "handoff is only available for Claude Code"
+  local selector="latest" project="$PWD" output=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project|-p) [ $# -ge 2 ] || die "usage: aiq claude handoff [<session>] [--project <dir>] [--out <file>]"; project="$2"; shift 2 ;;
+      --out|-o) [ $# -ge 2 ] || die "usage: aiq claude handoff [<session>] [--project <dir>] [--out <file>]"; output="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "aiq claude handoff: unknown option '$1'" ;;
+      *) selector="$1"; shift ;;
+    esac
+  done
+  [ -n "$output" ] || output="$AIQ_DIR/handoffs/${selector}.md"
+  mkdir -p "$(dirname "$output")" || die "could not create handoff directory"
+  local out; out="$(_py handoff "$(_np "$P_HOST/projects")" "$(_np "$project")" "$(_np "$P_ROOT")" "$selector" "$(_np "$output")" 2>/dev/null)"
+  local err; err="$(_field "$out" error)"
+  [ -z "$err" ] || die "$err"
+  info "handoff written: $output"
+  info "start a new Claude session under the target account and tell it to read this file, inspect the worktree, and continue the unfinished work"
+}
+
 act_ls() {
   _sync quiet
   printf '%s%s%s\n' "$C_B" "$P_LABEL" "$C_RST"
@@ -1317,6 +1769,7 @@ act_save() {
 }
 
 act_use() {
+  # Claude resume is owner-aware; a foreign session is handed off to a fresh session.
   local key="${1:-}" name d out email plan td rd same newer resume="" want=""
   [ -z "$key" ] && die "usage: aiq $PROV_CLI use <name|alias> [--global] [-c|--resume]"
   shift
@@ -1376,6 +1829,7 @@ act_use() {
   _sync
   _backup "$P_ACTIVE" "preuse"
   [ "$PROV" = claude ] && _backup "$P_SESSION" "preuse"
+  [ "$PROV" = claude ] && _claude_refresh_profile "$d" || true
   _load "$d" || die "could not switch to '$name'"
 
   out="$(_py active "$PROV" "${P_ARGS[@]}" 2>/dev/null)"
@@ -1389,7 +1843,7 @@ act_use() {
       if [ "$PROV" = claude ]; then
         case "$rd" in
           ""|-*) warn "access AND refresh token are expired — run 'claude' and /login again" ;;
-          *)     info "access token expired; the CLI refreshes it on next run (refresh good for ${rd}d)" ;;
+          *)     info "access token expired; run 'aiq claude refresh $name' (refresh good for ${rd}d)" ;;
         esac
       else
         info "id token expired; the CLI refreshes it on next run"
@@ -1399,11 +1853,39 @@ act_use() {
   if [ -n "$resume" ]; then _use_resume "$resume" "$@"; fi
 }
 
+_claude_resume_owner() {
+  local row sid owner email profile updated state branch request path target_id handoff out
+  row="$(_py sessions "$(_np "$P_HOST/projects")" "$(_np "$PWD")" "$(_np "$P_ROOT")" 1 2>/dev/null)"
+  [ -n "$row" ] || return 0
+  IFS=$US read -r sid owner email profile updated state branch request path <<< "$row"
+  [ -n "$sid" ] || return 0
+  target_id="$(_field "$(_py active claude "${P_ARGS[@]}" 2>/dev/null)" id)"
+  [ -z "$owner" ] || [ -z "$target_id" ] || [ "$owner" = "$target_id" ] && return 0
+  handoff="$AIQ_DIR/handoffs/${sid}.md"
+  mkdir -p "$(dirname "$handoff")" || true
+  out="$(_py handoff "$(_np "$P_HOST/projects")" "$(_np "$PWD")" "$(_np "$P_ROOT")" "$sid" "$(_np "$handoff")" 2>/dev/null)"
+  if [ -n "$(_field "$out" error)" ]; then
+    warn "cannot create handoff for foreign Claude session '$sid'"
+    return 1
+  fi
+  warn "Claude session '$sid' belongs to ${email:-another account}; it cannot be resumed with this account"
+  info "created handoff: $handoff"
+  if command -v "$P_CLI" >/dev/null 2>&1; then
+    info "starting a fresh Claude session and asking it to extract the unfinished work"
+    exec "$P_CLI" "Read the handoff file at '$handoff', inspect the current worktree, verify the unfinished task, and continue it. Do not resume the source session."
+  fi
+  warn "$P_CLI is not on PATH; start a new session and read '$handoff'"
+  return 1
+}
+
 _use_resume() {
   # Hand straight over to the CLI to continue the current session, now billed to
   # the account we just switched to. Reached only when no CLI was running (the
   # switch would have refused otherwise), so there is nothing to clobber.
   local mode="$1"; shift
+  if [ "$PROV" = claude ]; then
+    _claude_resume_owner || return 0
+  fi
   if ! command -v "$P_CLI" >/dev/null 2>&1; then
     warn "$P_CLI is not on PATH — the account is switched; resume the session yourself"
     return 0
@@ -1934,12 +2416,15 @@ WHICH COMMAND?  pick by what you want; aiq assumes nothing and prints the scope
   I want to...                                  then run
   --------------------------------------------  ----------------------------------
   switch account, in every terminal             aiq <p> use <name>
-    ^ and keep this conversation going          aiq <p> use <name> -c
-    ^ and pick which past conversation first    aiq <p> use <name> --resume
+    ^ and continue work (owner-aware for Claude) aiq <p> use <name> -c
+    ^ and pick a past conversation first        aiq <p> use <name> --resume
   run two accounts at once, a terminal each     aiq <p> run <name>    (in each)
     ^ but stay in this shell                    eval "$(aiq <p> env <name>)"
   try another account for one command only      aiq <p> run <name> -- <cmd>
   change the account a lane is signed into      aiq <p> login <name> --force
+  inspect Claude sessions and their owners      aiq claude sessions
+  refresh an expired Claude access token       aiq claude refresh [profile]
+  hand off Claude work to another account       aiq claude handoff <session-id>
   see who's who / how much quota is left        aiq ls  ·  aiq quota
   save the account I'm signed in as (do first)  aiq <p> save <name>
   retire accounts that no longer authenticate   aiq <p> prune [--yes]
@@ -1980,9 +2465,11 @@ ACCOUNTS - one active account at a time
       --global                  assert it - a no-op that documents intent
       -c | --continue           after switching, run `<cli> --continue`
       --resume                  after switching, run `<cli> --resume` (a picker)
-                                Transcripts and history survive a switch, so the
-                                conversation just carries on under the new
-                                account - these flags only save you a command.
+                                Claude sessions remain bound to their owner. If
+                                the selected account differs, aiq writes a local
+                                handoff and starts a fresh session instead.
+                                Use `aiq claude sessions` to inspect ownership.
+  aiq <p> refresh [name]          refresh a Claude access token from its saved refresh token
   aiq <p> active                show the signed-in account
   aiq <p> run <name> [-c]       run it in an isolated lane (this command only);
                                 -c / --resume launch straight into the CLI
@@ -2117,8 +2604,9 @@ QUOTA AND STATUS
                run `aiq <p> save <name>` while signed in as it to fix)
 
   For Claude, dead is decided by the REFRESH token, which lives about 27 days -
-  not by the access token. An expired access token is normal: the CLI mints a
-  new one every run.
+  not by the access token. An expired access token is normal: use
+  aiq claude refresh [profile] to mint one immediately from the saved refresh token.
+  If no refresh token remains, Claude's /login is required.
 AIQHELP
 }
 
@@ -2170,11 +2658,12 @@ SCOPE - global switch vs. lane
     process is affected; other terminals and the global account do not move.
     Each lane refreshes its own token in place, so several can run at once.
     Use this to run two accounts side by side. Conversation transcripts are
-    shared with the global config, so --continue works across both scopes.
+    shared with the global config; --continue works across scopes only when the
+    selected account owns the session. A foreign session needs a handoff.
 
   WHICH DO I RUN?
     just switch, everywhere ............... aiq <p> use <name>
-    switch + keep this chat going ......... aiq <p> use <name> -c
+    switch + continue owner-aware work .... aiq <p> use <name> -c
     switch + pick a chat to resume ....... aiq <p> use <name> --resume
     two accounts, two terminals .......... aiq <p> run <name>   in each
     two accounts, keep this shell ........ eval "$(aiq <p> env <name>)"
@@ -2195,8 +2684,9 @@ SCOPE - global switch vs. lane
 
   -c / --resume work on both `use` and `run`. They map to `claude --continue`
   / `claude --resume`, and `codex resume --last` / `codex resume`. A switch
-  never touches transcripts or project history, so the conversation simply
-  carries on under the new account - the flag only saves you a second command.
+  never touches transcripts or project history. For Claude, the session owner
+  still must match; otherwise aiq writes a handoff and starts a new session.
+  For Codex, the existing resume command continues under the selected account.
 AIQHELP
 }
 
@@ -2236,7 +2726,7 @@ main() {
     printf 'commands:   ls · quota · active · doctor · help\n' >&2
     case "$1" in
       # they typed an action but left out which CLI it applies to
-      ls|list|use|switch|save|add|who|rm|remove|delete|archive|restore|prune|sync|\
+      ls|list|use|switch|save|add|who|rm|remove|delete|archive|restore|prune|refresh|sync|\
       login|new|envs|env|run|workspace|ws|import|adopt|rename|mv)
         printf '\ndid you mean:  aiq claude %s    (or: aiq codex %s)\n' "$1" "$1" >&2 ;;
       c|cl|cla*|anthropic*|antropic)
@@ -2251,7 +2741,16 @@ main() {
   PROV_CLI="$1"; shift
   local action="${1:-ls}"; [ $# -gt 0 ] && shift
   case "$action" in
-    ls|list)          act_ls "${1:-}" ;;
+   ls|list)          act_ls "${1:-}" ;;
+   sessions|session-list|list-sessions) act_sessions "$@" ;;
+   handoff)          act_handoff "$@" ;;
+   session)
+     case "${1:-}" in
+       list|ls) shift; act_sessions "$@" ;;
+       handoff) shift; act_handoff "$@" ;;
+       *) act_sessions "$@" ;;
+     esac ;;
+    refresh)          act_refresh "$@" ;;
     use|switch)       act_use "$@" ;;
     archive)          act_archive "${1:-}" ;;
     restore|unarchive) act_restore "${1:-}" ;;

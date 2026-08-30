@@ -55,7 +55,10 @@ That is not a bug in the CLI. It is OAuth refresh-token rotation:
   same time in two terminals**.
 
 Neither loses your work: a switch leaves conversations untouched, and a lane
-shares them with your real config. See *Two scopes* below.
+shares them with your real config. Claude conversation sessions remain owned by
+the account that created them; changing account therefore starts a new session
+with a local handoff instead of attempting a cross-account resume. See *Two
+scopes* below.
 
 Internally it matches accounts by stable identity (`accountUuid` for Claude,
 `chatgpt_account_id` for Codex), not by file hash. A file hash changes on every
@@ -118,8 +121,11 @@ command, and every run prints a `scope:` line back.
 | I want to… | run |
 |---|---|
 | change which account I use, everywhere | `aiq <p> use <name>` |
-| …and keep this conversation going on it | `aiq <p> use <name> -c` |
-| …and pick which past conversation first | `aiq <p> use <name> --resume` |
+| inspect Claude sessions and their owners | `aiq claude sessions` |
+| refresh an expired Claude access token | `aiq claude refresh [name]` |
+| hand off unfinished Claude work to another account | `aiq claude handoff <session-id>` |
+| …and continue work (owner-aware for Claude) | `aiq <p> use <name> -c` |
+| …and pick a past conversation first | `aiq <p> use <name> --resume` |
 | run two accounts at once, a terminal each | `aiq <p> run <name>` in each |
 | …but stay in this shell | `eval "$(aiq <p> env <name>)"` |
 | try another account for one command only | `aiq <p> run <name> -- <cmd>` |
@@ -129,13 +135,14 @@ Asserting the wrong scope is a clean error, not a surprise: `use --lane` and
 `run --global` both refuse and name the right command, `use` inside a lane shell
 is refused outright, and `use --global` / `run --lane` are no-ops that document
 intent. `aiq help scope` has the same guide in the terminal.
+Claude note: `-c` / `--resume` can only reopen a session owned by the selected account; a foreign session uses `handoff`.
 
 ## Switch a single account
 
 ```sh
 aiq claude save personal main    # save the signed-in account as a profile
 aiq claude use work              # switch (GLOBAL — every terminal)
-aiq claude use work -c           # switch, then `claude --continue` the chat
+aiq claude use work -c           # resume if owner matches; otherwise hand off
 aiq codex rename acc6 a6          # rename a saved profile; alias is kept
 aiq claude active                # who am I right now?
 ```
@@ -145,8 +152,12 @@ up what it is about to overwrite, and refuses to run while a CLI session is open
 (that session would rewrite the auth file on exit and undo the switch).
 
 For Claude it copies only the *account* keys of `~/.claude.json` — your projects,
-MCP servers, history, and conversation transcripts stay exactly where they are,
-so a switched-to account can `--continue` / `--resume` the same conversation.
+MCP servers, history, and conversation transcripts stay exactly where they are.
+However, Claude binds each conversation session to the account that created it:
+switching to another account cannot use `--continue` / `--resume` on that source
+session. `aiq claude sessions` shows the owner; `aiq claude handoff <session-id>`
+writes a compact-style handoff, and `use`/`run -c` automatically opens a fresh
+session with that handoff when it detects a different owner.
 `-c` / `--resume` on `use` (and `run`) just fold that second command into the
 switch.
 
@@ -230,8 +241,9 @@ aiq claude restore old
 | `dead` | no usable local credential; sign in again or log in again |
 
 For Claude, `dead` is driven by the **refresh** token (~27 day life), not the
-short-lived access token. An expired access token is normal; the CLI mints a new
-one on the next run.
+short-lived access token. An expired access token is normal; `aiq claude refresh`
+mints one immediately from the saved refresh token and preserves any rotated
+token. If no refresh token remains, interactive `/login` is required.
 
 ## Commands
 
@@ -244,6 +256,13 @@ accounts     ls [--archived|--all] · login · save · use · rename · active
              quota · rm · archive · restore · prune [--yes] · sync
 lanes        envs · env <name> · env rm <name> · run <name> [-- cmd...]
              workspace (ws) · workspace rename          (legacy forms)
+
+claude sessions [--project <dir>]          list project sessions and owners
+claude handoff <session-id>                write compact-style context for a fresh account
+claude refresh [profile]                    refresh a saved access token
+
+`refresh` runs the OAuth exchange immediately and backs up the old credential
+first. It never guesses from an expiry timestamp: without a saved refresh token,
 
 use  <name> [--global] [-c | --resume]      run <name> [--lane] [-c | --resume]
 ```
