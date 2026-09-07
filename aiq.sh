@@ -518,6 +518,30 @@ def prof_read(provider, pdir):
             # column can say which it is instead of assuming.
             if window.get("window_minutes"):
                 d[tag + "_win"] = str(window["window_minutes"])
+        # Banked resets ride in the same snapshot, under the same freshness rule.
+        rc = usage.get("reset_credits") or {}
+        if rc.get("available") is not None:
+            d["bank"] = str(rc["available"])
+        if rc.get("expires_at"):
+            d["bank_exp"] = iso_local(rc["expires_at"])
+        if rc.get("title"):
+            d["bank_title"] = rc["title"]
+        # Everything the old quota row printed after the columns, kept as one
+        # trailing note. A spent window is already visible as 100%, so only an
+        # unusual reason for it is worth the space.
+        notes = []
+        bal = usage.get("credits_balance")
+        if bal not in (None, "", "0"):
+            notes.append("credits " + str(bal))
+        hit = usage.get("limit_reached")
+        if hit and hit != "rate_limit_reached":
+            notes.append(str(hit).replace("_", " "))
+        for cap in usage.get("limits") or []:
+            if isinstance(cap, dict) and cap.get("severity") not in (None, "normal"):
+                notes.append("%s at %s%% (%s)" % (cap.get("kind"), cap.get("percent"),
+                                                  cap.get("severity")))
+        if notes:
+            d["note"] = " · ".join(notes)
         d["q_at"] = ms_local(float(fetched) * 1000)
     d["saved_at"] = meta.get("saved_at") or ""
     d["cred_path"] = cred
@@ -611,7 +635,9 @@ def cmd_list(argv):
             d.get("q5h_reset"), d.get("q7d_reset"), d.get("q5h_win"), d.get("q7d_win"),
             stale, "1" if d.get("id") else "",
             d.get("sub_days"), d.get("saved_at"),
-            health(provider, d))
+            health(provider, d), d.get("q_at"),
+            d.get("bank"), d.get("bank_exp"), d.get("bank_title"),
+            d.get("note"))
 
 
 def cmd_match(argv):
@@ -937,7 +963,8 @@ def codex_ask(exe, home, auth, timeout):
             if o.get("id") == 2:
                 got["account"] = o.get("result") or {}
             elif o.get("id") == 3:
-                got["limits"] = (o.get("result") or {}).get("rateLimits") or {}
+                got["result"] = o.get("result") or {}
+                got["limits"] = got["result"].get("rateLimits") or {}
                 got["rpc_error"] = o.get("error")
                 break
     try:
@@ -984,6 +1011,7 @@ def cmd_codex_usage(argv):
         print("error	" + got["error"])
         return
     lim = got.get("limits") or {}
+    res = got.get("result") or {}
     acct = ((got.get("account") or {}).get("account") or {})
     body = {"_fetched_at": time.time()}
     for src, tag, key in (("primary", "q5h", "five_hour"),
@@ -1007,8 +1035,33 @@ def cmd_codex_usage(argv):
     bal = (lim.get("credits") or {}).get("balance")
     if bal not in (None, "", "0"):
         print("credits\t" + str(bal))
+    # Banked resets: one-off grants that clear a spent window early. The count
+    # is what you compare between accounts; the expiry is the deadline to beat,
+    # so report the credit that lapses first rather than the whole list.
+    rc = res.get("rateLimitResetCredits") or {}
+    avail = rc.get("availableCount")
+    if isinstance(avail, int):
+        print("bank\t" + str(avail))
+        body["reset_credits"] = {"available": avail}
+    first = None
+    for c in rc.get("credits") or []:
+        if not isinstance(c, dict) or c.get("status") != "available":
+            continue
+        when = c.get("expiresAt")
+        if when and (first is None or when < first[0]):
+            first = (when, c.get("title") or "")
+    if first:
+        at = epoch_iso(first[0])
+        print("bank_exp\t" + iso_local(at))
+        if first[1]:
+            print("bank_title\t" + first[1])
+        body.setdefault("reset_credits", {}).update(
+            {"expires_at": at, "title": first[1]})
+    if bal not in (None, ""):
+        body["credits_balance"] = str(bal)
     if lim.get("rateLimitReachedType"):
         print("warn\tlimit reached (%s)" % lim["rateLimitReachedType"])
+        body["limit_reached"] = lim["rateLimitReachedType"]
     if cache:
         try:
             with open(cache, "w", encoding="utf-8") as f:
@@ -1398,6 +1451,7 @@ _days_cell() {
 _pct_cell() {
   local p="$1"
   if [ -z "$p" ]; then printf '%5s' "-"; return; fi
+  case "$p" in *.*) p="$(awk -v v="$p" 'BEGIN{ r=int(v+0.5); if (r==0 && v+0>0) r=1; printf "%d", r }')" ;; esac
   if awk -v p="$p" 'BEGIN{exit !(p+0 >= 80)}'; then
     printf '%s%5s%s' "$C_RED" "${p}%" "$C_RST"
   else
@@ -1414,50 +1468,96 @@ _health_cell() {
   esac
 }
 
+# `ls` and `quota` differ in where the numbers come from, not in what they mean,
+# so they share this one table. `quota` refreshes the snapshot first; `ls` reads
+# whatever the last refresh left behind. Anything the refresh could not reach
+# carries the reason on its own row.
+LIST_AS_OF=""; LIST_BANKS=""; QUOTA_ERR=""
+
 _list_one() {
   # _list_one [--archived]
   local arch="${1:-}" shown=0
-  local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat st mcol
+  local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat
+  local st qat bank bankexp banktitle note mcol
+  LIST_AS_OF=""; LIST_BANKS=""
   if [ "$PROV" = claude ]; then
-    printf '%s%-2s %-24s %-16s %-30s %-5s %-8s %9s %5s %5s %16s %16s%s\n' "$C_DIM" \
+    printf '%s%-2s %-14s %-10s %-38s %-5s %-8s %8s %5s %5s %16s %16s%s\n' "$C_DIM" \
       "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "REFRESH" "5H" "7D" "5H RESET" "7D RESET" "$C_RST"
   else
-    printf '%s%-2s %-24s %-16s %-34s %-5s %-8s %10s %9s %9s %16s %16s%s\n' "$C_DIM" \
-      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "SUB ENDS" "PRIMARY" "SECONDARY" \
+    printf '%s%-2s %-14s %-10s %-38s %-5s %-8s %8s %9s %9s %4s %16s %16s%s\n' "$C_DIM" \
+      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "SUB ENDS" "PRIMARY" "SECONDARY" "BANK" \
       "PRIMARY RESETS" "SECONDARY RESETS" "$C_RST"
   fi
-  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat st; do
+  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid \
+                        subd savedat st qat bank bankexp banktitle note; do
     [ -z "$name" ] && continue
     shown=1
+    [ -n "$qat" ] && LIST_AS_OF="$qat"
+    # Three wide, to line up under the "@ " header plus its separating space.
     case "$mark" in
-      '*') mcol="${C_GRN}* ${C_RST}" ;;
-      '=') mcol="${C_DIM}= ${C_RST}" ;;
-      '~') mcol="${C_YEL}~ ${C_RST}" ;;
-      *)   mcol="  " ;;
+      '*') mcol="${C_GRN}*  ${C_RST}" ;;
+      '=') mcol="${C_DIM}=  ${C_RST}" ;;
+      '~') mcol="${C_YEL}~  ${C_RST}" ;;
+      *)   mcol="   " ;;
     esac
     printf '%s' "$mcol"
+    printf '%-14.14s %-10.10s %-38.38s %-5.5s ' "$name" "$alias" "$email" "$plan"
+    _health_cell "$st"; printf ' '
     if [ "$PROV" = claude ]; then
-      printf '%-24s %-16.16s %-30.30s %-5.5s ' "$name" "$alias" "$email" "$plan"
-      _health_cell "$st"; printf ' '
       # The refresh token is the real lifetime. The access token above it is
       # short-lived by design and the CLI renews it on every run.
       _days_cell "$rd" 7; printf ' '
       _pct_cell "$q5"; printf ' '; _pct_cell "$q7"; printf ' '; _reset_cell "$q5r"; printf ' '; _reset_cell "$q7r"
     else
-      printf '%-24s %-16.16s %-34.34s %-5.5s ' "$name" "$alias" "$email" "$plan"
-      _health_cell "$st"; printf ' '; _days_cell "$subd" 3; printf ' '
+      _days_cell "$subd" 3; printf ' '
       # Codex names its windows by length, not by role, so the cell carries the
       # label: "5h 12%" on plus, "30d 100%" on free.
       _win_cell "$q5" "$q5w"; printf ' '; _win_cell "$q7" "$q7w"; printf ' '
+      _bank_cell "$bank" "$q5" "$q7"; printf ' '
       _reset_cell "$q5r"; printf ' '; _reset_cell "$q7r"
+      case "${bank:-0}" in
+        ""|0) ;;
+        *) LIST_BANKS="$LIST_BANKS$name$US$bank$US$bankexp$US$banktitle
+" ;;
+      esac
     fi
+    [ -n "$note" ] && printf '  %s%s%s' "$C_DIM" "$note" "$C_RST"
     [ -z "$hasid" ] && printf '  %sno identity — run: aiq %s save %s%s' "$C_DIM" "$PROV_CLI" "$name" "$C_RST"
+    _quota_err_note "$name"
     printf '\n'
   done < <(_py list "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" $arch 2>/dev/null)
   if [ "$shown" = 0 ]; then
     if [ -n "$arch" ]; then info "  nothing archived"
     else info "  no profiles yet — sign in, then: aiq $PROV_CLI save <name> [alias]"; fi
   fi
+  return 0
+}
+
+_quota_err_note() {
+  # Why one row could not be refreshed, printed on that row rather than in a
+  # heap at the bottom where it would no longer say which account it belongs to.
+  local msg
+  [ -n "$QUOTA_ERR" ] || return 0
+  msg="$(printf '%s' "$QUOTA_ERR" | awk -F"$US" -v k="$1" '$1==k{print $2; exit}')"
+  [ -n "$msg" ] && printf '  %s%s%s' "$C_DIM" "$msg" "$C_RST"
+  return 0
+}
+
+_bank_notes() {
+  # What each banked reset actually is, and the date it lapses. Kept off the
+  # table because the count is what you compare; this is what you act on.
+  [ -n "$LIST_BANKS" ] || return 0
+  local name n exp title line
+  while IFS=$US read -r name n exp title; do
+    [ -n "$name" ] || continue
+    line="$n reset"; [ "$n" = 1 ] || line="${line}s"
+    [ -n "$title" ] && line="$line — $title"
+    # A month out: the date is the deadline, the clock time is noise.
+    [ -n "$exp" ] && line="$line, expires ${exp%% *}"
+    printf '  %sbank  %-14.14s %s%s\n' "$C_DIM" "$name" "$line" "$C_RST"
+  done <<EOF
+$LIST_BANKS
+EOF
   return 0
 }
 
@@ -1521,29 +1621,17 @@ _win_cell() {
   fi
 }
 
-_codex_quota_cell() {
-  # Live percentages for one saved codex profile, printed on the current row.
-  local name="$1" d home out err q5 q7 r5 r7 w5 w7 bal warn
-  d="$P_ROOT/$name"
-  home="$AIQ_CACHE/codex/$name"
-  out="$(_py codex_usage "$(_np "$home")" "$(_np "$(_cred_in "$d")")" \
-        "$(_np "$d/usage.json")" 2>/dev/null)"
-  err="$(_field "$out" error)"
-  if [ -n "$err" ]; then
-    printf '   %s%s%s' "$C_DIM" "$err" "$C_RST"; return 0
+_bank_cell() {
+  # Banked resets: one-off grants that clear a spent window early. Worth
+  # highlighting only once a window is actually spent — that is when you would
+  # spend one. Dim otherwise, so it reads as inventory and not as an alarm.
+  local n="$1" p5="$2" p7="$3"
+  case "${n:-0}" in ""|0) printf '%4s' "-"; return ;; esac
+  if awk -v a="${p5:-0}" -v b="${p7:-0}" 'BEGIN{exit !(a+0 >= 80 || b+0 >= 80)}'; then
+    printf '%s%4s%s' "$C_GRN" "$n" "$C_RST"
+  else
+    printf '%s%4s%s' "$C_DIM" "$n" "$C_RST"
   fi
-  q5="$(_field "$out" q5h)"; q7="$(_field "$out" q7d)"
-  r5="$(_field "$out" q5h_reset)"; r7="$(_field "$out" q7d_reset)"
-  w5="$(_field "$out" q5h_win)"; w7="$(_field "$out" q7d_win)"
-  bal="$(_field "$out" credits)"; warn="$(_field "$out" warn)"
-  [ -n "$q5" ] && { printf '   %s ' "$(_win_label "$w5")"; _pct_cell "$q5"; }
-  [ -n "$q7" ] && { printf '   %s ' "$(_win_label "$w7")"; _pct_cell "$q7"; }
-  # At a high percentage the only question that matters is when it clears.
-  [ -n "$r5" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$w5")" "${r5#* }" "$C_RST"
-  [ -n "$r7" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$w7")" "${r7#* }" "$C_RST"
-  [ -n "$bal" ] && printf '   %scredits %s%s' "$C_DIM" "$bal" "$C_RST"
-  [ -n "$warn" ] && printf '   %s%s%s' "$C_YEL" "$warn" "$C_RST"
-  return 0
 }
 
 _field() { printf '%s' "$1" | awk -F'\t' -v k="$2" '$1==k{print $2}'; }
@@ -1601,6 +1689,7 @@ act_handoff() {
 }
 
 act_ls() {
+  case "${1:-}" in --live|--refresh) act_quota; return $? ;; esac
   _sync quiet
   printf '%s%s%s\n' "$C_B" "$P_LABEL" "$C_RST"
   case "${1:-}" in
@@ -1610,13 +1699,18 @@ act_ls() {
                 _list_one --archived; return 0 ;;
   esac
   _list_one
+  _bank_notes
   info "  ^ profiles: what plain \`$P_CLI\` uses.  * = active now.  switch: aiq $PROV_CLI use <name>"
-  _list_workspaces
+  # Same columns as `quota`, older numbers. Naming the moment they were taken
+  # beats "run it again" — it says whether running it again would change much.
+  local asof=""
+  [ -n "$LIST_AS_OF" ] && asof=" (taken $LIST_AS_OF)"
   if [ "$PROV" = claude ]; then
-    info "  5H/7D here is Claude Code's own cache; for live numbers: aiq claude quota"
+    info "  5H/7D: cached$asof — live for every saved account: aiq claude quota"
   else
-    info "  PRIMARY/SECONDARY is the last aiq codex quota; for live numbers run it again"
+    info "  PRIMARY/SECONDARY/BANK: cached$asof — live: aiq codex quota"
   fi
+  _list_workspaces
   local nd; nd="$(_py dead "$PROV" "$(_np "$P_ROOT")" 2>/dev/null | wc -l | tr -d ' ')"
   [ "${nd:-0}" -gt 0 ] && info "  $nd unusable profile(s) — review with: aiq $PROV_CLI prune"
   return 0
@@ -1924,97 +2018,62 @@ act_rm() {
   printf 'removed %s — its credentials are in %s\n' "$name" "$AIQ_BACKUPS/$PROV"
 }
 
+_quota_refresh() {
+  # Fetch live numbers for every saved profile into the same usage.json that
+  # `ls` reads. Fetching and rendering are separate on purpose: one table then
+  # serves both commands, and a profile that could not be reached keeps its last
+  # snapshot with the reason printed beside it.
+  QUOTA_ERR=""
+  local rows n mark name rest out err
+  rows="$(_py list "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null)"
+  n="$(printf '%s' "$rows" | grep -c . 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ] || return 0
+  printf '%s  fetching live numbers for %s account(s)…%s\n' "$C_DIM" "$n" "$C_RST" >&2
+  while IFS=$US read -r mark name rest; do
+    [ -n "$name" ] || continue
+    if [ "$PROV" = claude ]; then
+      # An expired access token cannot read usage, and asking anyway just burns
+      # requests until the API rate-limits us.
+      case "$(printf '%s' "$rest" | cut -d"$US" -f4)" in
+        ""|-*) QUOTA_ERR="$QUOTA_ERR$name${US}access token expired — aiq claude refresh $name
+"; continue ;;
+      esac
+      out="$(_py usage "$(_np "$(_cred_in "$P_ROOT/$name")")" \
+             "$(_np "$P_ROOT/$name/usage.json")" 2>/dev/null)"
+    else
+      out="$(_py codex_usage "$(_np "$AIQ_CACHE/codex/$name")" \
+             "$(_np "$(_cred_in "$P_ROOT/$name")")" \
+             "$(_np "$P_ROOT/$name/usage.json")" 2>/dev/null)"
+    fi
+    err="$(_field "$out" error)"
+    [ -n "$err" ] && QUOTA_ERR="$QUOTA_ERR$name${US}$err
+"
+  done <<EOF
+$rows
+EOF
+  return 0
+}
+
 act_quota() {
   _sync quiet
-  printf '%s%s%s
-' "$C_B" "$P_LABEL" "$C_RST"
-  if [ "$PROV" != claude ]; then
-    local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat
-    while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat; do
-      [ -z "$name" ] && continue
-      printf '  %s %-12.12s %-38.38s %-5s ' "${mark:- }" "$name" "$email" "$plan"
-      _days_cell "$subd" 3
-      if [ "${AIQ_OFFLINE:-}" = 1 ]; then
-        [ -n "$q5" ] && { printf '   %s ' "$(_win_label "$q5w")"; _pct_cell "$q5"; }
-        [ -n "$q7" ] && { printf '   %s ' "$(_win_label "$q7w")"; _pct_cell "$q7"; }
-        [ -n "$q5r" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$q5w")" "${q5r#* }" "$C_RST"
-        [ -n "$q7r" ] && printf '   %s%s resets %s%s' "$C_DIM" "$(_win_label "$q7w")" "${q7r#* }" "$C_RST"
-        [ -n "$q5$q7" ] && printf '   %scached%s' "$C_DIM" "$C_RST"
-      else
-        _codex_quota_cell "$name"
-      fi
-      printf '\n'
-    done < <(_py list codex "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null)
-    if [ "${AIQ_OFFLINE:-}" = 1 ]; then
-      info "  offline: last saved snapshot only. Unset AIQ_OFFLINE for live numbers."
-    else
-      info "  live from each account's own codex app-server — the same numbers as /status."
-    fi
-    return 0
-  fi
-
-  # Claude: ask Anthropic for each saved account, not just the signed-in one.
-  local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat
-  # The signed-in account may not be saved anywhere yet — show it first, and say so.
+  printf '%s%s%s\n' "$C_B" "$P_LABEL" "$C_RST"
+  # The signed-in account may not be saved anywhere yet, in which case it has no
+  # row below. Say so before the table rather than leaving a silent gap.
   if [ -f "$P_ACTIVE" ] && [ -z "$(_match)" ]; then
-    local aout aerr a5 a7 r5 r7
-    printf '  %s %-12.12s %-30.30s ' "!" "<signed in>"       "$(_field "$(_py active claude "${P_ARGS[@]}" 2>/dev/null)" email)"
-    if [ "${AIQ_OFFLINE:-}" = 1 ]; then
-      printf '%soffline%s
-' "$C_DIM" "$C_RST"
-    else
-      aout="$(_py usage "$(_np "$P_ACTIVE")" 2>/dev/null)"
-      aerr="$(_field "$aout" error)"
-      if [ -n "$aerr" ]; then printf '%s%s%s
-' "$C_DIM" "$aerr" "$C_RST"
-      else
-        a5="$(_field "$aout" q5h)"; a7="$(_field "$aout" q7d)"
-        r5="$(_field "$aout" q5h_reset)"; r7="$(_field "$aout" q7d_reset)"
-        printf '5h '; _pct_cell "$a5"; printf '   7d '; _pct_cell "$a7"
-        [ -n "$r5" ] && printf '   5h reset %s' "$r5"
-        [ -n "$r7" ] && printf '   7d reset %s' "$r7"
-        printf '   %sNOT SAVED — run: aiq claude save <name>%s
-' "$C_YEL" "$C_RST"
-      fi
-    fi
+    warn "signed in as $(_field "$(_py active "$PROV" "${P_ARGS[@]}" 2>/dev/null)" email) is not saved — aiq $PROV_CLI save <name>"
   fi
-  while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat; do
-    [ -z "$name" ] && continue
-    printf '  %s %-12.12s %-30.30s ' "${mark:- }" "$name" "$email"
-    local src="cache" out="" err r5="" r7=""
-    # An expired access token cannot read usage, and asking anyway just burns
-    # requests until the API rate-limits us.
-    case "$td" in
-      ""|-*)
-        printf '%saccess token expired - aiq claude use %s, then run claude once%s\n' "$C_DIM" "$name" "$C_RST"
-        continue ;;
-    esac
-    if [ "${AIQ_OFFLINE:-}" != 1 ]; then
-      out="$(_py usage "$(_np "$(_cred_in "$P_ROOT/$name")")" "$(_np "$P_ROOT/$name/usage.json")" 2>/dev/null)"
-      err="$(_field "$out" error)"
-      if [ -n "$err" ]; then
-        printf '%s%s%s
-' "$C_DIM" "$err" "$C_RST"
-        continue
-      fi
-      q5="$(_field "$out" q5h)"; q7="$(_field "$out" q7d)"; src="live"
-      r5="$(_field "$out" q5h_reset)"; r7="$(_field "$out" q7d_reset)"
-    fi
-    printf '5h '; _pct_cell "$q5"; printf '   7d '; _pct_cell "$q7"
-    # At a high percentage the only question that matters is when it clears.
-    [ -n "$r5" ] && printf '   %s5h reset %s%s' "$C_DIM" "${r5#* }" "$C_RST"
-    [ -n "$r7" ] && printf '   %s7d reset %s%s' "$C_DIM" "${r7#* }" "$C_RST"
-    [ "$src" = cache ] && printf '   %scached%s' "$C_DIM" "$C_RST"
-    local w; w="$(_field "$out" warn)"
-    [ -n "$w" ] && printf '   %s%s%s' "$C_YEL" "$w" "$C_RST"
-    printf '
-'
-  done < <(_py list claude "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null)
+  if [ "${AIQ_OFFLINE:-}" = 1 ]; then QUOTA_ERR=""; else _quota_refresh; fi
+  _list_one
+  _bank_notes
   if [ "${AIQ_OFFLINE:-}" = 1 ]; then
     info "  offline: last saved snapshot only. Unset AIQ_OFFLINE for live numbers."
-  else
+  elif [ "$PROV" = claude ]; then
     info "  live from Anthropic's OAuth usage endpoint — the same source as /usage in Claude Code."
+  else
+    info "  live from each account's own codex app-server — the same numbers as /status."
   fi
+  _list_workspaces
+  return 0
 }
 
 # ---------------------------------------------------- parallel workspaces ---
@@ -2410,7 +2469,7 @@ START HERE
   aiq claude save main        remember the account you are signed in as
                               ^ do this first: an account you have not saved
                                 is lost the moment you switch away from it
-  aiq quota                   how much of the plan each account has used
+  aiq quota                   the same table, with the numbers refreshed first
 
 WHICH COMMAND?  pick by what you want; aiq assumes nothing and prints the scope
   I want to...                                  then run
@@ -2426,6 +2485,7 @@ WHICH COMMAND?  pick by what you want; aiq assumes nothing and prints the scope
   refresh an expired Claude access token       aiq claude refresh [profile]
   hand off Claude work to another account       aiq claude handoff <session-id>
   see who's who / how much quota is left        aiq ls  ·  aiq quota
+    ^ same table; quota refreshes it first        aiq <p> ls --live
   save the account I'm signed in as (do first)  aiq <p> save <name>
   retire accounts that no longer authenticate   aiq <p> prune [--yes]
 
@@ -2581,9 +2641,9 @@ QUOTA AND STATUS
   token. Profiles whose access token has already expired are skipped, since the
   call cannot succeed. AIQ_OFFLINE=1 uses the last saved snapshot instead.
 
-  The 5H/7D columns in `ls` come from Claude Code's own cache, which it only
-  updates when you open /usage. Anything older than 6 hours is left blank rather
-  than shown as a stale number. Use `aiq claude quota` for live figures.
+  The 5H/7D columns in `ls` come from the last quota run, or from Claude Code's
+  own cache, which it only updates when you open /usage. Anything older than 6
+  hours is left blank rather than shown as a stale number.
 
   For Codex this asks each account's own `codex app-server` for its live rate
   limits - the same numbers as Codex's own /status. It reads the saved auth.json
@@ -2592,8 +2652,18 @@ QUOTA AND STATUS
   length (5h / 7d / 30d) rather than by role. AIQ_OFFLINE=1 uses the last saved
   snapshot; set AIQ_CODEX_BIN if the codex CLI is not on PATH.
 
-  The PRIMARY/SECONDARY columns in `ls` are whatever the last `aiq codex quota`
-  saved; run it again for live figures.
+  BANK is Codex's banked resets: one-off grants that clear a spent window early.
+  The column is the count, so you can compare accounts at a glance; the `bank`
+  line under the table says what each one resets and the date it lapses. It turns
+  green once a window is actually spent - that is when you would spend one.
+
+  ONE TABLE, TWO AGES
+  `ls` and `quota` print the same table. `ls` reads the last snapshot and names
+  the moment it was taken; `quota` refreshes the snapshot first and then prints
+  it. `aiq <p> ls --live` is the same as `aiq <p> quota`. `ls` stays instant
+  because a refresh costs one network call, or one codex app-server, per account.
+  An account the refresh could not reach keeps its old numbers and carries the
+  reason on its own row.
 
   STATUS
     ok         usable

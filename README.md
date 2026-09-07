@@ -6,25 +6,39 @@ how much quota each one has left. One bash script. Linux, macOS, Windows (Git Ba
 ```
 $ aiq ls
 Claude Code
-@  PROFILE                  ALIAS            ACCOUNT                        PLAN  STATUS     REFRESH    5H    7D         5H RESET         7D RESET
-*  personal                 main             me@example.com                 pro   ok          24.1d   39%   25% 2026-03-04 18:20 2026-03-09 07:00
-   work                     team             me@work.example                max   expiring     4.2d    8%   12% 2026-03-04 21:45 2026-03-10 07:00
-   old                      -                stale@example.com              pro   dead      expired     -     -                -                -
+@  PROFILE        ALIAS      ACCOUNT                                PLAN  STATUS    REFRESH    5H    7D         5H RESET         7D RESET
+*  personal       main       me@example.com                         pro   ok          24.1d   39%   25% 2026-03-04 18:20 2026-03-09 07:00
+   work           team       me@work.example                        max   expiring     4.2d    8%   12% 2026-03-04 21:45 2026-03-10 07:00
+   old            -          stale@example.com                      pro   dead      expired     -     -                -                -
   ^ profiles: what plain `claude` uses.  * = active now.  switch: aiq claude use <name>
+  5H/7D: cached (taken 2026-03-04 14:02) — live for every saved account: aiq claude quota
 
 Lanes  (isolated; `run <name>` / `env <name>` — separate from the account above)
   LANE             ACCOUNT                        PLAN   BELONGS TO
   work             me@work.example                max    profile work
 
 Codex CLI
-@  PROFILE                  ALIAS            ACCOUNT                            PLAN  STATUS     SUB ENDS   PRIMARY SECONDARY   PRIMARY RESETS SECONDARY RESETS
-*  main                     personal         me@example.com                     plus  ok           22.4d    5h 12%    7d 63% 2026-03-04 18:13 2026-03-09 09:51
-   spare                    -                other@example.com                  free  ok               -  30d 100%         - 2026-03-28 14:57                -
+@  PROFILE        ALIAS      ACCOUNT                                PLAN  STATUS   SUB ENDS   PRIMARY SECONDARY BANK   PRIMARY RESETS SECONDARY RESETS
+*  main           personal   me@example.com                         plus  ok          22.4d    5h 12%    7d 63%    1 2026-03-04 18:13 2026-03-09 09:51
+   spare          -          other@example.com                      free  ok              -  30d 100%         -    - 2026-03-28 14:57                -
+  bank  main           1 reset — Full reset (Weekly + 5 hr), expires 2026-04-02
+  PRIMARY/SECONDARY/BANK: cached (taken 2026-03-04 14:02) — live: aiq codex quota
 ```
 
-Percentages and reset times only appear while they are fresh (6h by default).
-Past that both go blank rather than showing you a spent window as if it were
-current — `aiq quota` fetches live numbers.
+`ls` and `quota` print the **same table**. The only difference is where the
+numbers come from: `ls` reads the last snapshot and says when it was taken,
+`quota` refreshes it first (`aiq <p> ls --live` is the same thing). `ls` stays
+instant because refreshing means one network call, or one `codex app-server`,
+per account.
+
+Percentages and reset times only appear while the snapshot is fresh (6h by
+default). Past that both go blank rather than showing you a spent window as if
+it were current.
+
+**BANK** is Codex's *banked resets* — one-off grants that clear a spent window
+early. The column is the count, so you can see at a glance which account still
+has one; the `bank` line under the table says what it resets and when it lapses.
+It turns green once a window is actually spent, which is when you would use it.
 
 ## The re-login trap
 
@@ -217,11 +231,16 @@ still has headroom before you switch to it. It is a read-only call and never
 refreshes a token. `AIQ_OFFLINE=1` falls back to the last saved snapshot.
 
 For Codex this asks each account's own `codex app-server` for its live rate
-limits — the same numbers as Codex's own `/status`. It reads the saved
-`auth.json` without rotating it. Plans meter different windows: plus/pro report a
-5h and a weekly window, free reports a single monthly one, so each column is
-labelled by length (`5h` / `7d` / `30d`). `AIQ_OFFLINE=1` falls back to the last
-saved snapshot; set `AIQ_CODEX_BIN` if the `codex` CLI is not on `PATH`.
+limits and banked resets — the same numbers as Codex's own `/status`. It reads
+the saved `auth.json` without rotating it. Plans meter different windows:
+plus/pro report a 5h and a weekly window, free reports a single monthly one, so
+each column is labelled by length (`5h` / `7d` / `30d`). `AIQ_OFFLINE=1` falls
+back to the last saved snapshot; set `AIQ_CODEX_BIN` if the `codex` CLI is not
+on `PATH`.
+
+Either way the fetch only writes the snapshot; the table itself is the one `ls`
+prints. An account that could not be reached keeps its previous numbers and
+carries the reason on its own row, instead of quietly going blank.
 
 ## Retire accounts you no longer use
 
