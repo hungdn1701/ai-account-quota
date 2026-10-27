@@ -2621,6 +2621,7 @@ act_use() {
     return 0
   fi
 
+  local prev_id; prev_id="$(_field "$(_py active "$PROV" "${P_ARGS[@]}" 2>/dev/null)" id)"
   _rescue_unsaved || exit 1
   _sync
   _backup "$P_ACTIVE" "preuse"
@@ -2645,7 +2646,9 @@ act_use() {
         info "access token expired; codex refreshes it on first use"
       fi ;;
   esac
-  if [ "$PROV" = codex ] && _ide_running; then
+  # Only a change of account leaves an editor holding the wrong one; using the
+  # same account again (say, after reloading the editor) does not.
+  if [ "$PROV" = codex ] && [ "$prev_id" != "$(_field "$out" id)" ] && _ide_running; then
     warn "an editor's Codex extension is running and still holds the previous account."
     warn "Reload that window (VS Code: Developer: Reload Window), or it may put it back."
   fi
