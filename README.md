@@ -39,11 +39,17 @@ aiq <cli> rm <name>          remove an account's login; conversations, skills an
 aiq <cli> restore <name>     undo rm
 aiq <cli> save <name>        save the account the CLI is signed in as right now
 aiq <cli> who                which account is signed in here
+aiq <cli> keep <name>...     keep only these accounts; remove every other one
 ```
 
 `<cli>` is `claude` (`cl`) or `codex` (`cx`). Every account has **one name**,
 and every command takes it. Behind that name aiq keeps the saved login, the copy
 `run` uses, and the quota numbers, and it keeps them from drifting apart.
+
+Wherever a command takes an existing account, its **email works too, or just
+the start of it**, as long as that fits one account: `aiq codex use kevin`
+instead of looking up which of `a1`…`a88` that was. A key that fits several
+accounts is refused with the candidates, never guessed.
 
 | I want to… | run |
 |---|---|
@@ -57,6 +63,7 @@ and every command takes it. Behind that name aiq keeps the saved login, the copy
 | delete an account (login only) | `aiq <cli> rm <name>` |
 | drop an account's side-by-side copy, keep the account | `aiq <cli> rm <name> --lane` |
 | remove every account that can no longer sign in | `aiq <cli> prune --yes` |
+| keep only the accounts I use, drop the rest and any duplicates | `aiq <cli> keep <name\|email>... --yes` |
 | inspect Claude sessions and their owners | `aiq claude sessions` |
 | hand unfinished Claude work to another account | `aiq claude handoff <session-id>` |
 | refresh an expired Claude access token now | `aiq claude refresh [name]` |
@@ -97,8 +104,25 @@ plugins, rules and settings are yours, so they stay. Conversations the lane
 recorded on its own are merged into yours first, and the links a lane has into
 your config are removed as links, never followed. The login and the lane's own
 settings are moved under `.archive/`, not deleted, which is why `restore` can
-bring them back. Only caches that re-download are dropped; for Codex that is the
-~460 MB of daemon binaries each lane carries.
+bring them back. Only copies codex rebuilds are dropped; for Codex that is the
+0.5–0.8 GB of binaries each lane carries (the daemon and the sandbox's copy).
+
+**`keep`** is `rm` for everything you did not name. List the accounts you use,
+by name or email; without `--yes` it only prints the plan:
+
+```
+$ aiq codex keep kevin brant ines somanh
+  keep    a1    kevinwarner733+3z@…
+  remove  a2    thomas…                 not in your list
+  remove  a6    brantbonner860@…        same account as a88
+  remove  a66   brantbonner860@…        same account as a88; its lane is running
+  …
+$ aiq codex keep kevin brant ines somanh --yes
+```
+
+A kept account saved under several names keeps one of them: the name you typed,
+else the one in use, else the newest login, else the one whose lane is running.
+The others go too. The account every terminal uses is never removed.
 
 ## Codex: the background daemon
 
@@ -338,7 +362,7 @@ writes one outside the directories above.
 | variable | effect |
 |---|---|
 | `AIQ_OFFLINE=1` | never call the network; use the last saved usage snapshot |
-| `AIQ_FORCE=1` | switch even while a CLI session is open (e.g. when every open codex runs in a lane) |
+| `AIQ_FORCE=1` | same as `--force` on `use`, `rm` and `keep`: go ahead while a CLI session is open (e.g. when every open codex runs in a lane) |
 | `AIQ_CODEX_BIN` | path to the `codex` executable when it is not on `PATH` |
 | `AIQ_CODEX_TIMEOUT` | seconds to wait for a Codex quota read (default 45) |
 | `AIQ_TIMEOUT` | seconds to wait for the Claude usage request (default 8) |

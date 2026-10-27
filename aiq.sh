@@ -646,12 +646,33 @@ def cmd_active(argv):
         print(k + "\t" + str(d[k]))
 
 
+def lane_state(provider, envroot, name, ident):
+    """The account's lane, as one word: - | idle | running | empty | other."""
+    lane = os.path.join(envroot, name) if envroot else ""
+    if not lane or not os.path.isdir(lane):
+        return "-"
+    lc, lsess = lane_files(provider, lane)
+    key, li = cred_fresh(provider, lc, lsess) if os.path.isfile(lc) else (None, "")
+    if key is None:
+        return "empty"
+    if ident and li and li != ident:
+        return "other"
+    info = jload(os.path.join(lane, "app-server-daemon", "daemon.pid")) or {}
+    return "running" if pid_file_alive(info) else "idle"
+
+
 def cmd_list(argv):
-    """provider root active_cred [active_session] [--archived] -> one row per profile"""
+    """provider root active_cred [active_session] [--archived] [--lanes envroot]
+    -> one row per profile"""
     provider, root = argv[0], argv[1]
     rest = argv[2:]
     arch = "--archived" in rest
     rest = [a for a in rest if a != "--archived"]
+    envroot = ""
+    if "--lanes" in rest:
+        i = rest.index("--lanes")
+        envroot = rest[i + 1] if i + 1 < len(rest) else ""
+        rest = rest[:i] + rest[i + 2:]
     _, acred, act = active_of([provider] + rest)
     aid, ahash = act.get("id", ""), sha(acred)
     base = os.path.join(root, ".archive") if arch else root
@@ -692,7 +713,7 @@ def cmd_list(argv):
             d.get("sub_days"), d.get("saved_at"),
             health(provider, d), d.get("q_at"),
             d.get("bank"), d.get("bank_exp"), d.get("bank_title"),
-            d.get("note"))
+            d.get("note"), lane_state(provider, envroot, name, d.get("id") or ""))
 
 
 def cmd_match(argv):
@@ -718,21 +739,65 @@ def cmd_match(argv):
         print(fallback)
 
 
-def cmd_resolve(argv):
-    """root key -> directory name matching a profile name or an alias"""
-    root, key = argv[0], argv[1]
-    for name in profiles_of(root):
-        if name == key:
-            print(name)
-            return
+def preferred(provider, root, names, envroot="", global_name=""):
+    """Names of one account, the one worth keeping first: the account in use
+    everywhere, then the newest login, then the one running in its lane."""
+    def score(n):
+        cred, sess = prof_files(provider, os.path.join(root, n))
+        key = cred_fresh(provider, cred, sess)[0] if cred else None
+        live = 0
+        if envroot:
+            info = jload(os.path.join(envroot, n, "app-server-daemon", "daemon.pid")) or {}
+            live = 1 if pid_file_alive(info) else 0
+        return (0 if n == global_name else 1, -(key if key is not None else float("-inf")), -live, n)
+    return sorted(names, key=score)
+
+
+def match_key(provider, root, key):
+    """What a key typed by a person means: a name, an alias, an email, or the
+    start of an email. -> (names, ids): every profile it fits, and how many
+    distinct accounts those are. Emails are only tried when provider is given."""
+    names = profiles_of(root)
+    if key in names:
+        return [key], 1
+    for name in names:
         try:
             with open(os.path.join(root, name, "profile.alias")) as f:
                 if f.read().strip() == key:
-                    print(name)
-                    return
+                    return [name], 1
         except Exception:
             pass
-    print("")
+    if not provider or len(key) < 3:
+        return [], 0
+    k = key.lower()
+    exact, start = [], []
+    for name in names:
+        d = prof_read(provider, os.path.join(root, name))
+        email = (d.get("email") or "").lower()
+        if email == k:
+            exact.append((name, d.get("id") or name))
+        elif email.startswith(k):
+            start.append((name, d.get("id") or name))
+    hits = exact or start
+    return [n for n, _ in hits], len({i for _, i in hits})
+
+
+def cmd_resolve(argv):
+    """root key [provider envroot global] -> the profile a name, alias or email
+    (or its start) means; "" if none; "ambiguous<TAB>names" if it fits several
+    accounts."""
+    root, key = argv[0], argv[1]
+    provider = argv[2] if len(argv) > 2 else ""
+    envroot = argv[3] if len(argv) > 3 else ""
+    global_name = argv[4] if len(argv) > 4 else ""
+    names, ids = match_key(provider, root, key)
+    if ids > 1:
+        print("ambiguous\t" + " ".join(names))
+    elif len(names) > 1:
+        # One account saved under several names: the copy worth using.
+        print(preferred(provider, root, names, envroot, global_name)[0])
+    else:
+        print(names[0] if names else "")
 
 
 def cmd_cmp(argv):
@@ -1266,6 +1331,22 @@ def cmd_plan(argv):
         row(name, pull, state)
 
 
+def kernel32():
+    """kernel32 with real signatures: ctypes would otherwise pass and return
+    every HANDLE as a 32-bit int."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    return k
+
+
 def pid_alive(pid):
     try:
         pid = int(pid)
@@ -1276,11 +1357,12 @@ def pid_alive(pid):
     if os.name == "nt":
         # os.kill(pid, 0) would TERMINATE the process on Windows; ask instead.
         import ctypes
-        k32 = ctypes.windll.kernel32
+        from ctypes import wintypes
+        k32 = kernel32()
         handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return False
-        code = ctypes.c_ulong(0)
+        code = wintypes.DWORD(0)
         ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
         k32.CloseHandle(handle)
         return bool(ok) and code.value == 259          # STILL_ACTIVE
@@ -1293,28 +1375,130 @@ def pid_alive(pid):
         return False
 
 
+def win_start_time(pid):
+    """Creation time of a Windows process as a FILETIME integer, or None."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = kernel32()
+    handle = k32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return None
+    times = [wintypes.FILETIME() for _ in range(4)]
+    ok = k32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times])
+    k32.CloseHandle(handle)
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime if ok else None
+
+
+def pid_file_alive(info):
+    """Is the process a Codex pid file names still that process? The file also
+    records when it started, so a pid Windows has since handed to some other
+    program does not count."""
+    pid = info.get("pid")
+    if not pid_alive(pid):
+        return False
+    want = str(info.get("processStartTime") or "")
+    if os.name == "nt" and want.isdigit():
+        return str(win_start_time(pid)) == want
+    return True
+
+
 def cmd_daemons(argv):
     """home... -> 1 or 0 per home: is that CODEX_HOME's managed app-server up?"""
     for home in argv:
         info = jload(os.path.join(home, "app-server-daemon", "daemon.pid")) or {}
-        print("1" if pid_alive(info.get("pid")) else "0")
+        print("1" if pid_file_alive(info) else "0")
+
+
+def cmd_stop_updater(argv):
+    """home -> stop that CODEX_HOME's daemon auto-updater.
+
+    `codex app-server daemon stop` stops the daemon but not its updater
+    (`app-server daemon pid-update-loop`), which keeps running from the home's
+    own copy of the binary with its log open. Until it is gone, the home can be
+    neither moved nor removed. The next `codex` in that home starts a new one."""
+    import signal, subprocess
+    info = jload(os.path.join(argv[0], "app-server-daemon", "daemon-updater.pid")) or {}
+    if not pid_file_alive(info):
+        print("stopped\t0")
+        return
+    pid = int(info["pid"])
+    if os.name == "nt":
+        k32 = kernel32()
+        handle = k32.OpenProcess(0x0001 | 0x00100000, False, pid)   # TERMINATE | SYNCHRONIZE
+        if not handle:
+            print("error\tcannot open process %d" % pid)
+            return
+        k32.TerminateProcess(handle, 1)
+        k32.WaitForSingleObject(handle, 5000)
+        k32.CloseHandle(handle)
+    else:
+        try:
+            args = subprocess.run(["ps", "-p", str(pid), "-o", "args="], stdout=subprocess.PIPE,
+                                  universal_newlines=True).stdout
+        except Exception:
+            args = ""
+        if "pid-update-loop" not in args:
+            print("stopped\t0")
+            return
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.1)
+    print("stopped\t1")
 
 
 def cmd_dupes(argv):
-    """provider root -> one line per account that is saved under several names"""
+    """provider root [envroot] [global] -> one line per account saved under
+    several names, the one worth keeping first"""
     provider, root = argv[0], argv[1]
+    envroot = argv[2] if len(argv) > 2 else ""
+    global_name = argv[3] if len(argv) > 3 else ""
     seen = {}
     for name in profiles_of(root):
-        pdir = os.path.join(root, name)
-        ident = prof_read(provider, pdir).get("id") or ""
+        ident = prof_read(provider, os.path.join(root, name)).get("id") or ""
         if ident:
-            cred, sess = prof_files(provider, pdir)
-            key = cred_fresh(provider, cred, sess)[0] if cred else None
-            seen.setdefault(ident, []).append((key if key is not None else float("-inf"), name))
+            seen.setdefault(ident, []).append(name)
     for names in seen.values():
         if len(names) > 1:
-            # Newest login first: that is the copy worth keeping.
-            print(" ".join(n for _, n in sorted(names, key=lambda x: -x[0])))
+            print(" ".join(preferred(provider, root, names, envroot, global_name)))
+
+
+def cmd_keep(argv):
+    """provider root envroot global key... -> what `keep` would do, one row each:
+    keep  name email note  |  drop  name email reason  |  error  key message"""
+    provider, root, envroot, global_name = argv[:4]
+    kept = {}                                   # account id -> kept name
+    errors = 0
+    for key in argv[4:]:
+        names, ids = match_key(provider, root, key)
+        if not names:
+            row("error", key, "no account matches it")
+            errors += 1
+        elif ids > 1:
+            row("error", key, "fits several accounts: " + " ".join(names) + " — be more specific")
+            errors += 1
+        else:
+            ident = prof_read(provider, os.path.join(root, names[0])).get("id") or names[0]
+            # The name you typed wins; otherwise the copy worth keeping.
+            kept.setdefault(ident, key if key in names else
+                            preferred(provider, root, names, envroot, global_name)[0])
+    if errors:
+        return
+    for name in profiles_of(root):
+        d = prof_read(provider, os.path.join(root, name))
+        ident = d.get("id") or name
+        email = d.get("email") or "-"
+        info = jload(os.path.join(envroot, name, "app-server-daemon", "daemon.pid")) or {}
+        running = "; its lane is running" if pid_file_alive(info) else ""
+        if kept.get(ident) == name:
+            row("keep", name, email, "in use now" if name == global_name else "")
+        elif name == global_name:
+            row("drop", name, email, "in use now — switch to another account first")
+        elif ident in kept:
+            row("drop", name, email, "same account as " + kept[ident] + running)
+        else:
+            row("drop", name, email, "not in your list" + running)
 
 
 # Settings that pick an account or a credential store. A lane holds a different
@@ -1452,7 +1636,7 @@ CMDS = {"dead": cmd_dead, "active": cmd_active, "list": cmd_list, "match": cmd_m
         "codex_usage": cmd_codex_usage, "lane_projects": cmd_lane_projects,
         "seed_projects": cmd_seed_projects, "sessions": cmd_sessions, "handoff": cmd_handoff,
         "newer": cmd_newer, "plan": cmd_plan, "daemons": cmd_daemons, "dupes": cmd_dupes,
-        "seed_config": cmd_seed_config}
+        "seed_config": cmd_seed_config, "keep": cmd_keep, "stop_updater": cmd_stop_updater}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
@@ -1590,6 +1774,29 @@ _daemon_stop() {
   return 0
 }
 
+_lane_quiesce() {
+  # _lane_quiesce <codex-home> <label> — nothing of Codex left running from a
+  # home that is about to be moved: the daemon, and the auto-updater `daemon
+  # stop` leaves behind with files open ("Permission denied" on the move).
+  [ "$PROV" = codex ] || return 0
+  _daemon_stop "$1" "$2" || return 1
+  [ -f "$1/app-server-daemon/daemon-updater.pid" ] || return 0
+  [ -n "$(_field "$(_py stop_updater "$(_np "$1")" 2>/dev/null)" error)" ] || return 0
+  warn "could not stop the Codex updater for $2"
+  return 1
+}
+
+_move_dir() {
+  # _move_dir <from> <to> — Windows lets go of a stopped process's files a
+  # moment after it exits; try again briefly before giving up.
+  local i
+  for i in 1 2 3 4 5 6; do
+    mv "$1" "$2" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  mv "$1" "$2"
+}
+
 _store() {
   # _store <profile-dir> [cred] [session] — a login -> profile. Default: the live one.
   local d="$1" cred="${2:-$P_ACTIVE}" sess="${3-$P_SESSION}"
@@ -1699,6 +1906,18 @@ _claude_refresh_profile() {
 
 _match() { _py match "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" 2>/dev/null | head -n1; }
 
+_resolve() {
+  # _resolve <name|alias|email> -> the saved account it means, or "". An email,
+  # or its start, works too: `aiq codex use kevin` instead of looking up `a1`.
+  local out
+  out="$(_py resolve "$(_np "$P_ROOT")" "$1" "$PROV" "$(_np "$P_ENVROOT")" "$(_global_name)" 2>/dev/null | head -n1)"
+  case "$out" in
+    ambiguous*) warn "'$1' fits several accounts (${out#ambiguous?}) — type more of it, or the name"
+                return 0 ;;
+  esac
+  printf '%s' "$out"
+}
+
 # --------------------------------------------------------------- autosync ---
 # The core of this tool. A running CLI silently rotates its refresh token and
 # rewrites the live auth file. If we overwrite that file without copying it back
@@ -1712,7 +1931,7 @@ act_refresh() {
   local key="${1:-}" name d active_name
   [ "$#" -le 1 ] || die "usage: aiq claude refresh [profile|alias]"
   if [ -n "$key" ]; then
-    name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+    name="$(_resolve "$key")"
     [ -n "$name" ] || die "no profile or alias called '$key' ? see: aiq claude ls"
   else
     name="$(_match)"
@@ -1896,24 +2115,36 @@ _health_cell() {
 # so they share this one table. `quota` refreshes the snapshot first; `ls` reads
 # whatever the last refresh left behind. Anything the refresh could not reach
 # carries the reason on its own row.
-LIST_AS_OF=""; LIST_BANKS=""; QUOTA_ERR=""
+LIST_AS_OF=""; LIST_BANKS=""; QUOTA_ERR=""; LIST_LANE_WARN=""
+
+_lane_cell() {
+  # The account's copy for `run`: none, at rest, or with its codex up.
+  case "$1" in
+    running)     printf '%s%-7s%s' "$C_GRN" "running" "$C_RST" ;;
+    idle)        printf '%-7s' "idle" ;;
+    other|empty) printf '%s%-7s%s' "$C_YEL" "$1" "$C_RST" ;;
+    *)           printf '%s%-7s%s' "$C_DIM" "-" "$C_RST" ;;
+  esac
+}
 
 _list_one() {
   # _list_one [--archived]
   local arch="${1:-}" shown=0
   local mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid subd savedat
-  local st qat bank bankexp banktitle note mcol
-  LIST_AS_OF=""; LIST_BANKS=""
+  local st qat bank bankexp banktitle note lane mcol
+  local -a lanes=()
+  LIST_AS_OF=""; LIST_BANKS=""; LIST_LANE_WARN=""
+  [ -z "$arch" ] && lanes=(--lanes "$(_np "$P_ENVROOT")")
   if [ "$PROV" = claude ]; then
-    printf '%s%-2s %-14s %-10s %-38s %-5s %-8s %8s %5s %5s %16s %16s%s\n' "$C_DIM" \
-      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "REFRESH" "5H" "7D" "5H RESET" "7D RESET" "$C_RST"
+    printf '%s%-2s %-14s %-10s %-38s %-5s %-8s %-7s %8s %5s %5s %16s %16s%s\n' "$C_DIM" \
+      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "LANE" "REFRESH" "5H" "7D" "5H RESET" "7D RESET" "$C_RST"
   else
-    printf '%s%-2s %-14s %-10s %-38s %-5s %-8s %8s %9s %9s %4s %16s %16s%s\n' "$C_DIM" \
-      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "SUB ENDS" "PRIMARY" "SECONDARY" "BANK" \
+    printf '%s%-2s %-14s %-10s %-38s %-5s %-8s %-7s %8s %9s %9s %4s %16s %16s%s\n' "$C_DIM" \
+      "@" "PROFILE" "ALIAS" "ACCOUNT" "PLAN" "STATUS" "LANE" "SUB ENDS" "PRIMARY" "SECONDARY" "BANK" \
       "PRIMARY RESETS" "SECONDARY RESETS" "$C_RST"
   fi
   while IFS=$US read -r mark name alias email plan td rd q5 q7 q5r q7r q5w q7w stale hasid \
-                        subd savedat st qat bank bankexp banktitle note; do
+                        subd savedat st qat bank bankexp banktitle note lane; do
     [ -z "$name" ] && continue
     shown=1
     [ -n "$qat" ] && LIST_AS_OF="$qat"
@@ -1927,6 +2158,14 @@ _list_one() {
     printf '%s' "$mcol"
     printf '%-14.14s %-10.10s %-38.38s %-5.5s ' "$name" "$alias" "$email" "$plan"
     _health_cell "$st"; printf ' '
+    _lane_cell "$lane"; printf ' '
+    # Only a lane that needs something gets a line under the table.
+    case "$lane" in
+      other) LIST_LANE_WARN="$LIST_LANE_WARN  lane $name is signed in as another account — aiq $PROV_CLI add $name --force
+" ;;
+      running) [ "$mark" = '*' ] && LIST_LANE_WARN="$LIST_LANE_WARN  lane $name runs your global account a second time — aiq $PROV_CLI rm $name --lane
+" ;;
+    esac
     if [ "$PROV" = claude ]; then
       # The refresh token is the real lifetime. The access token above it is
       # short-lived by design and the CLI renews it on every run.
@@ -1949,7 +2188,7 @@ _list_one() {
     [ -z "$hasid" ] && printf '  %sno identity — run: aiq %s save %s%s' "$C_DIM" "$PROV_CLI" "$name" "$C_RST"
     _quota_err_note "$name"
     printf '\n'
-  done < <(_py list "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" $arch 2>/dev/null)
+  done < <(_py list "$PROV" "$(_np "$P_ROOT")" "${P_ARGS[@]}" $arch ${lanes[@]+"${lanes[@]}"} 2>/dev/null)
   if [ "$shown" = 0 ]; then
     if [ -n "$arch" ]; then info "  nothing archived"
     else info "  no accounts yet — add one: aiq $PROV_CLI add <name>"; fi
@@ -1985,50 +2224,24 @@ EOF
   return 0
 }
 
-_list_workspaces() {
-  local d name out email plan here cur seen=" " note prof i global
-  local -a lanes=() ups=() native=()
-  cur="$(_env_current_name)"
-  global="$(_global_name)"
+_lane_notes() {
+  # Lanes are the LANE column of the table above. Below it, only what needs
+  # doing: a lane in a bad state, or one the table has no row for.
+  local d name email cur
+  [ -n "$LIST_LANE_WARN" ] && printf '%s%s%s' "$C_YEL" "$LIST_LANE_WARN" "$C_RST"
   for d in "$P_ENVROOT"/*/; do
     [ -d "$d" ] || continue
+    name="$(basename "${d%/}")"
+    [ -d "$P_ROOT/$name" ] && continue
     _env_paths "${d%/}"
-    [ -f "$EV_CRED" ] && lanes+=("${d%/}")
+    [ -f "$EV_CRED" ] || continue
+    email="$(_field "$(_py active "$PROV" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null)" email)"
+    printf '  %slane %s holds %s, which is not a saved account — aiq %s save %s --workspace %s%s\n' \
+      "$C_YEL" "$name" "${email:-a login}" "$PROV_CLI" "$name" "$name" "$C_RST"
   done
-  [ "${#lanes[@]}" -gt 0 ] || return 0
-  if [ "$PROV" = codex ]; then
-    for d in "${lanes[@]}"; do native+=("$(_np "$d")"); done
-    while IFS= read -r out; do ups+=("$out"); done < <(_py daemons "${native[@]}" 2>/dev/null)
-  fi
-  printf '\n%sLanes%s  %s(aiq %s run <name>: that account in one terminal, next to the others)%s\n' \
-    "$C_B" "$C_RST" "$C_DIM" "$PROV_CLI" "$C_RST"
-  printf '%s  %-16s %-30s %-6s %s%s\n' "$C_DIM" "LANE" "ACCOUNT" "PLAN" "NOTE" "$C_RST"
-  for i in "${!lanes[@]}"; do
-    d="${lanes[$i]}"; _env_paths "$d"
-    name="$(basename "$d")"
-    out="$(_py active "$PROV" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null)"
-    email="$(_field "$out" email)"; plan="$(_field "$out" plan)"
-    prof="$(_py match "$PROV" "$(_np "$P_ROOT")" "$(_np "$EV_CRED")" ${EV_SESS:+"$(_np "$EV_SESS")"} 2>/dev/null | head -n1)"
-    if [ -z "$prof" ]; then
-      note="${C_YEL}not saved — aiq $PROV_CLI save $name --workspace $name${C_RST}"
-    elif [ "$prof" != "$name" ]; then
-      note="${C_YEL}holds account '$prof'${C_RST}"
-    else
-      note=""
-    fi
-    if case "$seen" in *" $email "*) true ;; *) false ;; esac; then
-      note="$note${note:+  }${C_YEL}another lane has this account too${C_RST}"
-    fi
-    [ -n "$email" ] && seen="$seen$email "
-    # Two live copies of one login: whichever refreshes second is replaying.
-    if [ -n "$prof" ] && [ "$prof" = "$global" ]; then
-      note="$note${note:+  }${C_YEL}also your global account — aiq $PROV_CLI rm $name --lane${C_RST}"
-    fi
-    [ "${ups[$i]:-0}" = 1 ] && note="$note${note:+  }${C_DIM}daemon running${C_RST}"
-    here=""; [ "$name" = "$cur" ] && here="  ${C_CYA}<- this shell${C_RST}"
-    printf '  %-16.16s %-30.30s %-6.6s %b%b\n' "$name" "${email:--}" "${plan:--}" "$note" "$here"
-  done
-  info "  remove a lane but keep its account: aiq $PROV_CLI rm <name> --lane"
+  cur="$(_env_current_name)"
+  [ -n "$cur" ] && info "  this shell runs in lane $cur"
+  return 0
 }
 _reset_cell() {
   [ -n "$1" ] && printf '%16.16s' "$1" || printf '%16s' "-"
@@ -2077,14 +2290,15 @@ _field() { printf '%s' "$1" | awk -F'\t' -v k="$2" '$1==k{print $2}'; }
 
 _list_dupes() {
   # One account under several names means several copies of one login, which
-  # refresh apart until one of them is replayed. Name the newest one to keep.
+  # refresh apart until one of them is replayed. Name the one to keep: the one
+  # in use, else the newest, else the one whose lane is running.
   local names rest
   while IFS= read -r names; do
     [ -n "$names" ] || continue
     rest="${names#* }"
-    printf '  %ssame account saved as %s — keep the newest: aiq %s rm %s%s\n' \
-      "$C_YEL" "${names// / = }" "$PROV_CLI" "$rest" "$C_RST"
-  done < <(_py dupes "$PROV" "$(_np "$P_ROOT")" 2>/dev/null)
+    printf '  %ssame account saved as %s — keep %s: aiq %s rm %s%s\n' \
+      "$C_YEL" "${names// / = }" "${names%% *}" "$PROV_CLI" "$rest" "$C_RST"
+  done < <(_py dupes "$PROV" "$(_np "$P_ROOT")" "$(_np "$P_ENVROOT")" "$(_global_name)" 2>/dev/null)
   return 0
 }
 
@@ -2155,7 +2369,7 @@ act_ls() {
   esac
   _list_one
   _bank_notes
-  info "  * = in use in every terminal.  switch: aiq $PROV_CLI use <name>  ·  side by side: aiq $PROV_CLI run <name>"
+  info "  * = in use in every terminal (aiq $PROV_CLI use <name>)  ·  LANE = its copy for running side by side (aiq $PROV_CLI run <name>)"
   # Same columns as `quota`, older numbers. Naming the moment they were taken
   # beats "run it again" — it says whether running it again would change much.
   local asof=""
@@ -2166,7 +2380,7 @@ act_ls() {
     info "  PRIMARY/SECONDARY/BANK: cached$asof — live: aiq codex quota"
   fi
   _list_dupes
-  _list_workspaces
+  _lane_notes
   local nd; nd="$(_py dead "$PROV" "$(_np "$P_ROOT")" 2>/dev/null | wc -l | tr -d ' ')"
   [ "${nd:-0}" -gt 0 ] && info "  $nd account(s) can no longer sign in — review with: aiq $PROV_CLI prune"
   return 0
@@ -2198,7 +2412,7 @@ act_rename() {
   [ -n "$from" ] && [ -n "$to" ] || die "usage: aiq $PROV_CLI rename <old> <new>"
   [ "$from" != "$to" ] || die "old and new account names are identical"
   _check_name "$to"
-  profile_name="$(_py resolve "$(_np "$P_ROOT")" "$from" 2>/dev/null | head -n1)"
+  profile_name="$(_resolve "$from")"
   if [ -n "$profile_name" ] && [ -d "$P_ROOT/$profile_name" ]; then
     has_profile=1
     profile_src="$P_ROOT/$profile_name"
@@ -2225,13 +2439,13 @@ act_rename() {
   # newest while the names still match.
   [ "$has_profile" = 1 ] && _reconcile "$profile_name"
   if [ "$has_workspace" = 1 ]; then
-    _daemon_stop "$workspace_src" "lane '$workspace_name'" || die "could not rename '$from'"
+    _lane_quiesce "$workspace_src" "lane '$workspace_name'" || die "could not rename '$from'"
   fi
   if [ "$has_profile" = 1 ]; then
     mv "$profile_src" "$profile_dst" || die "could not rename account '$profile_name'"
   fi
   if [ "$has_workspace" = 1 ]; then
-    if ! mv "$workspace_src" "$workspace_dst"; then
+    if ! _move_dir "$workspace_src" "$workspace_dst"; then
       [ "$has_profile" = 0 ] || mv "$profile_dst" "$profile_src"
       die "could not rename lane '$workspace_name'"
     fi
@@ -2250,7 +2464,7 @@ act_prune() {
     name="${line%%$'\t'*}"; email="${line#*$'\t'}"
     count=$((count + 1))
     if [ -n "$yes" ]; then
-      _rm_account "$name" || true
+      _rm_account "$name" "" brief || true
     else
       printf '  %-12s %s\n' "$name" "$email"
     fi
@@ -2258,6 +2472,8 @@ act_prune() {
 
   if [ "$count" = 0 ]; then
     info "nothing to prune — every $P_LABEL account can still sign in"
+  elif [ -n "$yes" ]; then
+    info "  only the logins went; undo any of them: aiq $PROV_CLI restore <name>"
   elif [ -z "$yes" ]; then
     printf '\n'
     info "$count account(s) above can no longer sign in."
@@ -2348,6 +2564,7 @@ act_use() {
       --resume)      resume=resume ;;
       -g|--global)   want=global ;;
       -l|--lane)     want=lane ;;
+      -f|--force)    AIQ_FORCE=1 ;;   # the same as AIQ_FORCE=1, which PowerShell cannot prefix
       --)            shift; break ;;
       -*)            die "aiq $PROV_CLI use: unknown option '$1'" ;;
       *)             die "aiq $PROV_CLI use: unexpected argument '$1' (name goes first)" ;;
@@ -2365,8 +2582,8 @@ act_use() {
     die "this shell is inside lane \"$lane\"; \`use\` (global switch) does not apply here. Open a normal terminal for a global switch, or run another account here with:  aiq $PROV_CLI run <name>"
   fi
 
-  name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
-  [ -z "$name" ] && die "no account or alias called '$key' — see: aiq $PROV_CLI ls"
+  name="$(_resolve "$key")"
+  [ -z "$name" ] && die "no account matches '$key' — see: aiq $PROV_CLI ls"
   d="$P_ROOT/$name"
   lane_dir="$(_env_dir "$name")"
   info "scope: GLOBAL — $name is now the $P_LABEL account for every terminal"
@@ -2374,8 +2591,8 @@ act_use() {
   if _switch_blocked; then
     warn "a $P_LABEL session is open. It holds the account it started with and would"
     warn "put that account back, undoing this switch. Close it first."
-    [ "$PROV" = codex ] && warn "If every open codex runs in a lane:  AIQ_FORCE=1 aiq codex use $name"
-    [ "$PROV" = claude ] && warn "Or re-run with AIQ_FORCE=1 if you really mean to."
+    [ "$PROV" = codex ] && warn "If every open codex runs in a lane:  aiq codex use $name --force"
+    [ "$PROV" = claude ] && warn "Or add --force if you really mean to."
     [ "${AIQ_FORCE:-}" = 1 ] || exit 1
   fi
 
@@ -2494,13 +2711,75 @@ act_active() {
     | awk -F'\t' '$2!="" && $1!~/^(has_cred|token_ms|refresh_due)$/ {printf "  %-13s %s\n",$1,$2}'
 }
 
+act_keep() {
+  # aiq <cli> keep <name|email>... [--yes] — say which accounts you use; every
+  # other one is removed the way `rm` removes it (archived, restorable), and so
+  # is any second name of a kept account. Without --yes it only shows the plan.
+  local yes="" verb name email note out rc=0 n=0
+  local -a keys=() drops=() running=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes)   yes=1 ;;
+      -f|--force) AIQ_FORCE=1 ;;
+      -*)         die "aiq $PROV_CLI keep: unknown option '$1'" ;;
+      *)        keys+=("$1") ;;
+    esac
+    shift
+  done
+  [ "${#keys[@]}" -gt 0 ] || die "usage: aiq $PROV_CLI keep <name|email>... [--yes]"
+  _sync quiet
+  _reconcile_all
+  out="$(_py keep "$PROV" "$(_np "$P_ROOT")" "$(_np "$P_ENVROOT")" "$(_global_name)" "${keys[@]}" 2>/dev/null)"
+  if printf '%s\n' "$out" | grep -q "^error$US"; then
+    printf '%s\n' "$out" | while IFS=$US read -r verb name note; do
+      [ "$verb" = error ] && warn "'$name': $note"
+    done
+    die "nothing changed — see: aiq $PROV_CLI ls"
+  fi
+  printf '%s%s%s\n' "$C_B" "$P_LABEL" "$C_RST"
+  while IFS=$US read -r verb name email note; do
+    case "$verb" in
+      keep) printf '  %skeep  %s  %-14.14s %-38.38s %s%s%s\n' "$C_GRN" "$C_RST" "$name" "$email" "$C_DIM" "$note" "$C_RST" ;;
+      drop) printf '  %sremove%s  %-14.14s %-38.38s %s%s%s\n' "$C_YEL" "$C_RST" "$name" "$email" "$C_DIM" "$note" "$C_RST"
+            case "$note" in "in use now"*) ;; *) drops+=("$name") ;; esac
+            case "$note" in *"lane is running"*) running+=("$name") ;; esac ;;
+    esac
+  done <<EOF
+$out
+EOF
+  if [ "${#drops[@]}" = 0 ]; then
+    info "nothing to remove"; return 0
+  fi
+  if [ -z "$yes" ]; then
+    printf '\n'
+    info "Remove them:  aiq $PROV_CLI keep ${keys[*]} --yes"
+    info "  only the logins go, archived (undo: aiq $PROV_CLI restore <name>); conversations and settings stay"
+    return 0
+  fi
+  # A running lane's daemon is stopped on the way out, which would cut off a
+  # session still using it. Check once, up front, not halfway through.
+  if [ "${#running[@]}" -gt 0 ] && _running && [ "${AIQ_FORCE:-}" != 1 ]; then
+    warn "lanes still running: ${running[*]}, and a $P_LABEL window is open."
+    warn "Close the windows using those accounts, or if none of them do:"
+    die  "aiq $PROV_CLI keep ${keys[*]} --yes --force"
+  fi
+  printf '\n'
+  for name in "${drops[@]}"; do
+    _rm_account "$name" "" brief && n=$((n + 1)) || rc=1
+  done
+  info "removed $n login(s); conversations, skills and settings are untouched"
+  info "  undo any of them: aiq $PROV_CLI restore <name>   ·   see them: aiq $PROV_CLI ls --deleted"
+  return "$rc"
+}
+
 act_rm() {
   local only="" key rc=0
   local -a keys=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --lane) only=lane ;;
-      -y|--yes|-f|--force) ;;   # nothing to confirm: rm archives, it never deletes
+      -y|--yes)   ;;            # nothing to confirm: rm archives, it never deletes
+      -f|--force) AIQ_FORCE=1 ;;
       -*) die "aiq $PROV_CLI rm: unknown option '$1'" ;;
       *)  keys+=("$1") ;;
     esac
@@ -2519,7 +2798,7 @@ _rm_account() {
   # what the lane recorded on its own is merged into them first. The login is
   # archived, not deleted: `restore` brings it back.
   local key="$1" only="${2:-}" name has_profile=0 has_lane=0 lane email dest=""
-  name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+  name="$(_resolve "$key")"
   if [ -n "$name" ]; then has_profile=1; else name="$key"; fi
   lane="$(_env_dir "$name")"
   [ -d "$lane" ] && has_lane=1
@@ -2542,13 +2821,13 @@ _rm_account() {
     fi
     if [ "$PROV" = codex ] && [ "$(_daemon_up "$lane")" = 1 ]; then
       if _running && [ "${AIQ_FORCE:-}" != 1 ]; then
-        warn "a codex session may be running as '$name'. Close it, or re-run with AIQ_FORCE=1."
+        warn "a codex session may be running as '$name'. Close it, or add --force."
         return 1
       fi
       _daemon_stop "$lane" "lane '$name'" || return 1
     elif [ "$PROV" = claude ] && _running && [ "${AIQ_FORCE:-}" != 1 ]; then
       warn "a Claude session is running; if it is in lane '$name', removing the lane would"
-      warn "break it. Close it, or re-run with AIQ_FORCE=1."
+      warn "break it. Close it, or add --force."
       return 1
     fi
   fi
@@ -2573,6 +2852,7 @@ _rm_account() {
     [ "$PROV" = codex ] && rm -rf "${AIQ_CACHE:?}/codex/${name:?}"
   fi
   printf 'removed %s%s%s%s\n' "$C_B" "$name" "$C_RST" "${email:+  $email}"
+  [ "${3:-}" = brief ] && return 0
   info "  only the login: conversations, skills and settings are untouched"
   info "  undo: aiq $PROV_CLI restore $(basename "${dest:-$name}")"
   return 0
@@ -2645,7 +2925,7 @@ act_quota() {
     info "  live from each account's own codex app-server — the same numbers as /status."
   fi
   _list_dupes
-  _list_workspaces
+  _lane_notes
   return 0
 }
 
@@ -2811,18 +3091,21 @@ _lane_retire() {
   # own config are removed as links, and the rest is archived. Only caches
   # that re-download are dropped — for Codex that is ~460MB of daemon binary.
   local d="$1" name="$2" e dest
+  _lane_quiesce "$d" "lane '$name'" || return 1
   _lane_share_projects "$d" "$name"
   for e in "$d"/* "$d"/.[!.]*; do
     [ -L "$e" ] || continue
     _unlink "$e" || { warn "could not unlink $e; lane '$name' left as it was"; return 1; }
   done
   if [ "$PROV" = codex ]; then
-    for e in packages cache tmp .tmp; do
+    # packages/: the daemon (~460MB); .sandbox-bin/: the sandbox's copy of codex
+    # (~300MB). Both are rebuilt by codex the next time the lane runs.
+    for e in packages .sandbox-bin cache tmp .tmp; do
       [ -e "$d/$e" ] && [ ! -L "$d/$e" ] && rm -rf "${d:?}/$e"
     done
   fi
   dest="$(_archive_slot "$P_ENVROOT/.archive" "$name")" || return 1
-  mv "$d" "$dest" || { warn "could not archive lane '$name'"; return 1; }
+  _move_dir "$d" "$dest" || { warn "could not archive lane '$name': a program still has files open in it"; return 1; }
   return 0
 }
 
@@ -2871,7 +3154,7 @@ _lane_for() {
   # saved login when it has none yet and bringing it up to the newest login.
   # Sets LANE_NAME and LANE_DIR. Messages go to stderr: `env` output is eval'd.
   local key="$1" profile_name
-  profile_name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+  profile_name="$(_resolve "$key")"
   if [ -n "$profile_name" ]; then LANE_NAME="$profile_name"
   elif [ -d "$(_env_dir "$key")" ]; then LANE_NAME="$key"
   else die "no account '$key' — see: aiq $PROV_CLI ls"; fi
@@ -2889,7 +3172,7 @@ act_env() {
   # Print environment assignments for the current shell.
   local name="${1:-}" fmt="${2:-}" native aiq_native host_native profile_name
   [ -z "$name" ] && die "usage: eval \"\$(aiq $PROV_CLI env <name>)\""
-  profile_name="$(_py resolve "$(_np "$P_ROOT")" "$name" 2>/dev/null | head -n1)"
+  profile_name="$(_resolve "$name")"
   # The global account needs no lane, and must not get a second live copy.
   if [ -n "$profile_name" ] && [ "$profile_name" = "$(_global_name)" ]; then
     printf "'%s' is your global account; this shell leaves any lane it was in\n" "$profile_name" >&2
@@ -2956,7 +3239,7 @@ act_run() {
   # The account the global config is signed in as needs no lane, and must not
   # get one: a second live copy of one login refreshes on its own, and the
   # provider then signs both out.
-  profile_name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+  profile_name="$(_resolve "$key")"
   if [ -n "$profile_name" ] && [ "$profile_name" = "$(_global_name)" ]; then
     info "scope: GLOBAL — '$profile_name' is already the account every terminal uses; running it here"
     # An idle lane daemon for this account would refresh its own copy sooner or later.
@@ -2984,7 +3267,7 @@ act_workspace() {
   # Legacy. `run` makes the lane when it is first needed; this only makes it early.
   local key="${1:-}" name
   [ -n "$key" ] || die "usage: aiq $PROV_CLI run <name>   (makes the lane when needed)"
-  name="$(_py resolve "$(_np "$P_ROOT")" "$key" 2>/dev/null | head -n1)"
+  name="$(_resolve "$key")"
   [ -n "$name" ] || die "no account called '$key'"
   [ -e "$(_env_dir "$name")" ] && die "lane '$name' already exists"
   _lane_create "$name" || die "could not create lane '$name'"
@@ -3177,7 +3460,9 @@ ACCOUNTS
   aiq <cli> restore <name>     ...brings it back
   aiq <cli> save <name>      save the account the CLI is signed in as right now
   aiq <cli> who              which account is signed in here
+  aiq <cli> keep <name>...   keep only these accounts; remove every other one
 
+  <name> can also be the account's email, or its start: aiq codex use kevin
   One name per account. aiq keeps the saved login, the copy `run` uses, and
   the quota numbers under that name, and keeps them from drifting apart.
 
@@ -3190,6 +3475,7 @@ WHICH ONE?
   sign an account in again ................... aiq <cli> add <name> --force
   drop the side-by-side copy, keep account ... aiq <cli> rm <name> --lane
   remove accounts that can no longer sign in . aiq <cli> prune --yes
+  keep only the accounts I use ............... aiq <cli> keep <name|email>... [--yes]
   Claude: sessions and who owns them ......... aiq claude sessions
 
 MORE HELP
@@ -3229,6 +3515,9 @@ ACCOUNTS
                                  merged into them first. Archived, not deleted.
       --lane                     remove only the lane; the account stays saved
   aiq <cli> restore <name>       undo rm
+  aiq <cli> keep <name|email>... keep only these accounts: shows what would go;
+      --yes                      removes every other account, the same way as rm,
+                                 and every second name of a kept account
   aiq <cli> prune [--yes]        list accounts that can no longer sign in;
                                  --yes removes them, the same way as rm
   aiq <cli> who                  who is signed in, here
@@ -3236,12 +3525,15 @@ ACCOUNTS
   aiq claude sessions            Claude conversations here, and who owns each
   aiq claude handoff <id>        carry a conversation over to another account
 
+  Wherever a command takes an existing account, its email works too, or just
+  the start of it, as long as that fits one account:  aiq codex use kevin
+
   ls marks: * in use   = same account as the one in use   ~ that copy is older
 
   Before anything overwrites a login, aiq saves the live one back into its
   account and backs up what it replaces (~/.aiq/backups). `use` refuses while a
-  session is open, because that session would put its own login back; pass
-  AIQ_FORCE=1 if you really mean to.
+  session is open, because that session would put its own login back; add
+  --force if you really mean to (rm and keep take it too).
 
   For Claude only the account keys of ~/.claude.json are carried across. Your
   projects, MCP servers and history stay where they are.
@@ -3442,7 +3734,7 @@ main() {
     printf 'commands:   ls · quota · who · doctor · help\n' >&2
     case "$1" in
       # they typed an action but left out which CLI it applies to
-      add|use|switch|run|env|save|rename|mv|rm|del|delete|remove|restore|prune|refresh|\
+      add|use|switch|run|env|save|rename|mv|rm|del|delete|remove|restore|prune|keep|refresh|\
       login|new|archive|envs|workspace|ws|sync)
         printf '\ndid you mean:  aiq claude %s    (or: aiq codex %s)\n' "$1" "$1" >&2 ;;
       c|cl|cla*|anthropic*|antropic)
@@ -3471,6 +3763,7 @@ main() {
     rm|del|delete|remove|archive) act_rm "$@" ;;
     restore|unarchive|undelete)  act_restore "${1:-}" ;;
     prune)                       act_prune "${1:-}" ;;
+    keep)                        act_keep "$@" ;;
     who|active|status)           act_active ;;
     quota|usage)                 act_quota ;;
     refresh)                     act_refresh "$@" ;;
@@ -3494,7 +3787,7 @@ main() {
         printf '\nAlso: aiq help quota · aiq help why · aiq help all\n'
       fi ;;
     *)  printf '%saiq: %s has no command "%s"%s\n' "$C_RED" "$PROV_CLI" "$action" "$C_RST" >&2
-        printf '\ntry one of:\n  ls · add · use · run · rename · rm · restore · who · quota\n\n' >&2
+        printf '\ntry one of:\n  ls · add · use · run · rename · rm · restore · keep · who · quota\n\n' >&2
         printf 'full help:  aiq help\n' >&2
         exit 1 ;;
   esac
